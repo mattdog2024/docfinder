@@ -6,6 +6,10 @@ on:
       - 'v*'          # 推送 v1.0、v1.1 等 tag 时自动触发
   workflow_dispatch:  # 也支持在 GitHub 网页上手动点击触发
 
+# 明确声明权限，允许创建 Release 和上传文件
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Windows EXE
