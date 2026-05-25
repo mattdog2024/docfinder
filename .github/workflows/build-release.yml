@@ -1,0 +1,129 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # 推送 v1.0、v1.1 等 tag 时自动触发
+  workflow_dispatch:  # 也支持在 GitHub 网页上手动点击触发
+
+jobs:
+  build:
+    name: Build Windows EXE
+    runs-on: windows-latest   # 在真实 Windows 环境中打包
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 设置 Python 环境
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-docx openpyxl python-pptx pdfplumber xlrd jieba PyQt5 pyinstaller
+
+      # 4. 获取版本号（从 tag 或默认值）
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="dev-$(date +'%Y%m%d')"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Build version: ${VERSION}"
+
+      # 5. 用 PyInstaller 打包成单个 exe
+      - name: Build EXE with PyInstaller
+        run: |
+          python -m PyInstaller `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "DocFinder_${{ steps.get_version.outputs.VERSION }}" `
+            --hidden-import jieba `
+            --hidden-import jieba.analyse `
+            --hidden-import jieba.posseg `
+            --hidden-import docx `
+            --hidden-import docx.oxml `
+            --hidden-import openpyxl `
+            --hidden-import openpyxl.styles `
+            --hidden-import pptx `
+            --hidden-import pptx.util `
+            --hidden-import pdfplumber `
+            --hidden-import xlrd `
+            --hidden-import PyQt5 `
+            --hidden-import PyQt5.QtWidgets `
+            --hidden-import PyQt5.QtCore `
+            --hidden-import PyQt5.QtGui `
+            --collect-data jieba `
+            --exclude-module matplotlib `
+            --exclude-module numpy `
+            --exclude-module scipy `
+            --exclude-module pandas `
+            --exclude-module tkinter `
+            --noupx `
+            main.py
+
+      # 6. 验证 exe 是否生成成功
+      - name: Verify EXE exists
+        run: |
+          $exePath = "dist\DocFinder_${{ steps.get_version.outputs.VERSION }}.exe"
+          if (Test-Path $exePath) {
+            $size = (Get-Item $exePath).Length / 1MB
+            Write-Host "EXE 生成成功: $exePath ($([math]::Round($size, 1)) MB)"
+          } else {
+            Write-Error "EXE 文件未找到！"
+            exit 1
+          }
+        shell: pwsh
+
+      # 7. 上传 exe 为 Artifact（方便下载调试）
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocFinder-${{ steps.get_version.outputs.VERSION }}-Windows
+          path: dist/DocFinder_${{ steps.get_version.outputs.VERSION }}.exe
+          retention-days: 30
+
+      # 8. 如果是 tag 推送，自动创建/更新 Release 并上传 exe
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "DocFinder ${{ steps.get_version.outputs.VERSION }}"
+          body: |
+            ## DocFinder ${{ steps.get_version.outputs.VERSION }}
+
+            ### 下载说明
+            直接下载下方的 `DocFinder_${{ steps.get_version.outputs.VERSION }}.exe`，双击即可运行，无需安装任何软件。
+
+            ### 系统要求
+            - Windows 10 / Windows 11 64位
+
+            ### 功能特性
+            - 支持 doc / docx / xls / xlsx / ppt / pptx / PDF 全文索引
+            - SQLite FTS5 + jieba 中文分词，毫秒级搜索
+            - 离线搜索：索引保存为 .db 文件，硬盘不在也能搜索
+            - 离线预览：关键词命中段落 + 查看全文
+            - 多线程并行索引，增量更新
+            - 明亮风格图形界面
+
+            ### 使用方法
+            1. 双击 exe 运行
+            2. 菜单 **索引 → 新建索引** 建立索引
+            3. 搜索框输入关键词，回车搜索
+            4. 双击结果打开文件（离线时弹出预览窗口）
+          files: dist/DocFinder_${{ steps.get_version.outputs.VERSION }}.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
