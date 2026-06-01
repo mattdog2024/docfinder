@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-文档内容提取模块
+文档内容提取模块 v1.3 - 性能优化版
 支持: docx, doc, xlsx, xls, pptx, ppt, pdf
+
+优化点：
+1. 内容截断：每个文件最多提取 MAX_CONTENT_CHARS 字符，避免超大文件拖慢速度
+2. xlsx 使用 read_only 模式，内存占用更低
+3. 所有提取函数加入超时保护（通过调用方控制）
 """
 
 import os
@@ -10,25 +15,45 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# 每个文件最多提取的字符数（约 10 万字，足够搜索用）
+# 超过此长度的内容直接截断，避免超大文件拖慢索引
+MAX_CONTENT_CHARS = 100_000
+
 
 def extract_docx(filepath: str) -> str:
-    """提取 .docx 文件文本"""
+    """提取 .docx 文件文本（优化版）"""
     try:
         from docx import Document
         doc = Document(filepath)
-        paragraphs = []
+        parts = []
+        total = 0
+
+        # 提取段落
         for para in doc.paragraphs:
             text = para.text.strip()
             if text:
-                paragraphs.append(text)
-        # 也提取表格中的文字
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    text = cell.text.strip()
-                    if text:
-                        paragraphs.append(text)
-        return '\n'.join(paragraphs)
+                parts.append(text)
+                total += len(text)
+                if total >= MAX_CONTENT_CHARS:
+                    break
+
+        # 提取表格（如果还没超限）
+        if total < MAX_CONTENT_CHARS:
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        text = cell.text.strip()
+                        if text:
+                            parts.append(text)
+                            total += len(text)
+                            if total >= MAX_CONTENT_CHARS:
+                                break
+                    if total >= MAX_CONTENT_CHARS:
+                        break
+                if total >= MAX_CONTENT_CHARS:
+                    break
+
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"提取 docx 失败 {filepath}: {e}")
         return ''
@@ -36,22 +61,22 @@ def extract_docx(filepath: str) -> str:
 
 def extract_doc(filepath: str) -> str:
     """提取 .doc 文件文本（使用 antiword 或 LibreOffice）"""
+    # 先尝试 antiword（速度快）
     try:
         import subprocess
-        # 尝试 antiword
         result = subprocess.run(
             ['antiword', filepath],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
+            return result.stdout[:MAX_CONTENT_CHARS]
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
+    # 再尝试 LibreOffice（速度慢，但兼容性好）
     try:
         import subprocess
         import tempfile
-        # 尝试用 LibreOffice 转换为 txt
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
                 ['libreoffice', '--headless', '--convert-to', 'txt:Text',
@@ -62,7 +87,7 @@ def extract_doc(filepath: str) -> str:
             txt_path = os.path.join(tmpdir, base + '.txt')
             if os.path.exists(txt_path):
                 with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    return f.read()
+                    return f.read(MAX_CONTENT_CHARS)
     except Exception as e:
         logger.warning(f"提取 doc 失败 {filepath}: {e}")
 
@@ -70,20 +95,31 @@ def extract_doc(filepath: str) -> str:
 
 
 def extract_xlsx(filepath: str) -> str:
-    """提取 .xlsx 文件文本"""
+    """提取 .xlsx 文件文本（read_only 模式，速度快）"""
     try:
         import openpyxl
+        # read_only=True 大幅减少内存占用和解析时间
         wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-        texts = []
+        parts = []
+        total = 0
         for sheet in wb.worksheets:
             for row in sheet.iter_rows(values_only=True):
+                row_texts = []
                 for cell in row:
                     if cell is not None:
                         val = str(cell).strip()
                         if val and val != 'None':
-                            texts.append(val)
+                            row_texts.append(val)
+                if row_texts:
+                    line = ' '.join(row_texts)
+                    parts.append(line)
+                    total += len(line)
+                    if total >= MAX_CONTENT_CHARS:
+                        break
+            if total >= MAX_CONTENT_CHARS:
+                break
         wb.close()
-        return ' '.join(texts)
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"提取 xlsx 失败 {filepath}: {e}")
         return ''
@@ -94,15 +130,24 @@ def extract_xls(filepath: str) -> str:
     try:
         import xlrd
         wb = xlrd.open_workbook(filepath)
-        texts = []
+        parts = []
+        total = 0
         for sheet in wb.sheets():
             for row_idx in range(sheet.nrows):
+                row_texts = []
                 for col_idx in range(sheet.ncols):
-                    cell = sheet.cell(row_idx, col_idx)
-                    val = str(cell.value).strip()
+                    val = str(sheet.cell(row_idx, col_idx).value).strip()
                     if val and val != '':
-                        texts.append(val)
-        return ' '.join(texts)
+                        row_texts.append(val)
+                if row_texts:
+                    line = ' '.join(row_texts)
+                    parts.append(line)
+                    total += len(line)
+                    if total >= MAX_CONTENT_CHARS:
+                        break
+            if total >= MAX_CONTENT_CHARS:
+                break
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"提取 xls 失败 {filepath}: {e}")
         return ''
@@ -113,21 +158,26 @@ def extract_pptx(filepath: str) -> str:
     try:
         from pptx import Presentation
         prs = Presentation(filepath)
-        texts = []
+        parts = []
+        total = 0
         for slide in prs.slides:
             for shape in slide.shapes:
-                if hasattr(shape, 'text'):
+                if hasattr(shape, 'text') and shape.text.strip():
                     text = shape.text.strip()
-                    if text:
-                        texts.append(text)
-                # 提取表格
+                    parts.append(text)
+                    total += len(text)
+                    if total >= MAX_CONTENT_CHARS:
+                        break
                 if shape.has_table:
                     for row in shape.table.rows:
                         for cell in row.cells:
                             text = cell.text.strip()
                             if text:
-                                texts.append(text)
-        return '\n'.join(texts)
+                                parts.append(text)
+                                total += len(text)
+            if total >= MAX_CONTENT_CHARS:
+                break
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"提取 pptx 失败 {filepath}: {e}")
         return ''
@@ -148,7 +198,7 @@ def extract_ppt(filepath: str) -> str:
             txt_path = os.path.join(tmpdir, base + '.txt')
             if os.path.exists(txt_path):
                 with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    return f.read()
+                    return f.read(MAX_CONTENT_CHARS)
     except Exception as e:
         logger.warning(f"提取 ppt 失败 {filepath}: {e}")
     return ''
@@ -158,13 +208,17 @@ def extract_pdf_text(filepath: str) -> str:
     """提取可识别 PDF 的文本"""
     try:
         import pdfplumber
-        texts = []
+        parts = []
+        total = 0
         with pdfplumber.open(filepath) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
-                    texts.append(text.strip())
-        return '\n'.join(texts)
+                    parts.append(text.strip())
+                    total += len(text)
+                    if total >= MAX_CONTENT_CHARS:
+                        break
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"提取 pdf 文本失败 {filepath}: {e}")
         return ''
@@ -176,14 +230,18 @@ def extract_pdf_ocr(filepath: str, progress_callback=None) -> str:
         import pytesseract
         from pdf2image import convert_from_path
         pages = convert_from_path(filepath, dpi=200)
-        texts = []
+        parts = []
+        total = 0
         for i, page_img in enumerate(pages):
             if progress_callback:
                 progress_callback(i + 1, len(pages))
             text = pytesseract.image_to_string(page_img, lang='chi_sim+eng')
             if text.strip():
-                texts.append(text.strip())
-        return '\n'.join(texts)
+                parts.append(text.strip())
+                total += len(text)
+                if total >= MAX_CONTENT_CHARS:
+                    break
+        return '\n'.join(parts)[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.warning(f"OCR 识别失败 {filepath}: {e}")
         return ''
@@ -194,7 +252,7 @@ def extract_text(filepath: str, enable_pdf: bool = True,
                  progress_callback=None) -> str:
     """
     统一入口：根据文件扩展名自动选择提取方式
-    返回提取到的文本内容
+    返回提取到的文本内容（最多 MAX_CONTENT_CHARS 字符）
     """
     ext = os.path.splitext(filepath)[1].lower()
 
@@ -213,7 +271,6 @@ def extract_text(filepath: str, enable_pdf: bool = True,
         if not enable_pdf:
             return ''
         text = extract_pdf_text(filepath)
-        # 如果提取到的文字很少（可能是扫描版），且开启了 OCR
         if len(text.strip()) < 50 and enable_ocr:
             logger.info(f"PDF 文字内容较少，尝试 OCR: {filepath}")
             ocr_text = extract_pdf_ocr(filepath, progress_callback)

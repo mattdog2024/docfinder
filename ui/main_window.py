@@ -36,7 +36,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.0"
+APP_VERSION = "1.3"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -292,11 +292,12 @@ QLabel#label_no_result {
 # ─── 工作线程 ─────────────────────────────────────────────────────────────────
 
 class IndexWorker(QThread):
-    """索引构建工作线程"""
+    """索引构建工作线程（v1.3：带速度统计）"""
     progress = pyqtSignal(int, int, str)   # current, total, filepath
     log_msg = pyqtSignal(str)              # 日志消息
     finished = pyqtSignal(dict)            # 完成，带统计信息
     error = pyqtSignal(str)                # 错误
+    speed_update = pyqtSignal(float, float, int, int)  # speed(files/s), eta(s), current, total
 
     def __init__(self, engine: IndexEngine, root_dir: str,
                  enabled_exts: List[str], enable_pdf: bool,
@@ -309,8 +310,29 @@ class IndexWorker(QThread):
         self.enable_ocr = enable_ocr
         self.max_workers = max_workers
         self.builder = IndexBuilder(engine)
+        self._start_time = 0.0
+        self._last_count = 0
+        self._last_time = 0.0
+
+    def _on_progress(self, cur: int, tot: int, fp: str):
+        """进度回调，计算速度和剩余时间"""
+        self.progress.emit(cur, tot, fp)
+        now = time.time()
+        # 每 0.5 秒更新一次速度
+        elapsed_since_last = now - self._last_time
+        if elapsed_since_last >= 0.5:
+            delta_files = cur - self._last_count
+            speed = delta_files / elapsed_since_last if elapsed_since_last > 0 else 0
+            remaining = tot - cur
+            eta = remaining / speed if speed > 0 else 0
+            self.speed_update.emit(speed, eta, cur, tot)
+            self._last_count = cur
+            self._last_time = now
 
     def run(self):
+        self._start_time = time.time()
+        self._last_time = self._start_time
+        self._last_count = 0
         try:
             stats = self.builder.build_index(
                 root_dir=self.root_dir,
@@ -318,7 +340,7 @@ class IndexWorker(QThread):
                 enable_pdf=self.enable_pdf,
                 enable_ocr=self.enable_ocr,
                 max_workers=self.max_workers,
-                progress_callback=lambda cur, tot, fp: self.progress.emit(cur, tot, fp),
+                progress_callback=self._on_progress,
                 log_callback=lambda msg: self.log_msg.emit(msg),
             )
             self.finished.emit(stats)
@@ -577,7 +599,9 @@ class IndexSettingsDialog(QDialog):
         thread_layout.addWidget(QLabel("并行处理线程数："))
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 16)
-        self.thread_spin.setValue(self.settings.get('max_workers', 4))
+        import os as _os
+        default_workers = max(4, _os.cpu_count() or 4)
+        self.thread_spin.setValue(self.settings.get('max_workers', default_workers))
         self.thread_spin.setMaximumWidth(80)
         thread_layout.addWidget(self.thread_spin)
         thread_layout.addWidget(QLabel("（推荐 4，CPU 核心数多可适当增加）"))
@@ -857,34 +881,99 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_progress_panel(self) -> QWidget:
-        """构建底部进度面板"""
+        """构建底部进度面板（v1.3：详细信息版）"""
         panel = QWidget()
-        panel.setStyleSheet("background: #E3F2FD; border-top: 1px solid #BBDEFB;")
+        panel.setStyleSheet(
+            "QWidget { background: #E8F4FD; border-top: 2px solid #1976D2; }"
+        )
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(6)
 
+        # 第一行：标题 + 停止按钮
         header_row = QHBoxLayout()
         self.progress_title = QLabel("正在建立索引...")
-        self.progress_title.setStyleSheet("font-weight: bold; color: #1565C0;")
+        self.progress_title.setStyleSheet(
+            "font-weight: bold; color: #1565C0; font-size: 13px;"
+        )
         header_row.addWidget(self.progress_title)
         header_row.addStretch()
 
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton("停止索引")
         self.stop_btn.setObjectName("btn_danger")
-        self.stop_btn.setMaximumWidth(70)
+        self.stop_btn.setMaximumWidth(90)
         self.stop_btn.setMaximumHeight(28)
         self.stop_btn.clicked.connect(self._stop_indexing)
         header_row.addWidget(self.stop_btn)
         layout.addLayout(header_row)
 
+        # 进度条
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(8)
+        self.progress_bar.setMaximumHeight(12)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { border-radius: 6px; background: #BBDEFB; }"
+            "QProgressBar::chunk { background: #1976D2; border-radius: 6px; }"
+        )
         layout.addWidget(self.progress_bar)
 
-        self.progress_label = QLabel("准备中...")
-        self.progress_label.setStyleSheet("color: #546E7A; font-size: 12px;")
+        # 第二行：统计数字（4列）
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(20)
+
+        # 已处理 / 总数
+        self.stat_count_label = QLabel("已处理：0 / 0")
+        self.stat_count_label.setStyleSheet(
+            "color: #1565C0; font-size: 12px; font-weight: bold;"
+        )
+        stats_row.addWidget(self.stat_count_label)
+
+        # 索引速度
+        self.stat_speed_label = QLabel("速度：-- 文件/秒")
+        self.stat_speed_label.setStyleSheet(
+            "color: #2E7D32; font-size: 12px; font-weight: bold;"
+        )
+        stats_row.addWidget(self.stat_speed_label)
+
+        # 剩余时间
+        self.stat_eta_label = QLabel("剩余：计算中...")
+        self.stat_eta_label.setStyleSheet(
+            "color: #E65100; font-size: 12px; font-weight: bold;"
+        )
+        stats_row.addWidget(self.stat_eta_label)
+
+        # 已用时间
+        self.stat_elapsed_label = QLabel("已用：0 秒")
+        self.stat_elapsed_label.setStyleSheet(
+            "color: #546E7A; font-size: 12px;"
+        )
+        stats_row.addWidget(self.stat_elapsed_label)
+
+        stats_row.addStretch()
+        layout.addLayout(stats_row)
+
+        # 第三行：当前文件
+        self.progress_label = QLabel("准备扫描文件...")
+        self.progress_label.setStyleSheet(
+            "color: #37474F; font-size: 11px; padding: 2px 0;"
+        )
+        self.progress_label.setWordWrap(False)
         layout.addWidget(self.progress_label)
+
+        # 第四行：日志区（可折叠，默认显示最近3条）
+        self.progress_log = QTextEdit()
+        self.progress_log.setReadOnly(True)
+        self.progress_log.setMaximumHeight(60)
+        self.progress_log.setStyleSheet(
+            "QTextEdit { background: #F0F8FF; border: 1px solid #BBDEFB; "
+            "border-radius: 4px; font-size: 11px; color: #37474F; }"
+        )
+        layout.addWidget(self.progress_log)
+
+        # 计时器：每秒更新已用时间
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed_time)
+        self._index_start_time = 0.0
 
         return panel
 
@@ -1041,13 +1130,25 @@ class MainWindow(QMainWindow):
         self.index_worker.log_msg.connect(self._on_index_log)
         self.index_worker.finished.connect(self._on_index_finished)
         self.index_worker.error.connect(self._on_index_error)
+        self.index_worker.speed_update.connect(self._on_speed_update)
         self.index_worker.start()
 
-        # 显示进度面板
+        # 显示进度面板，重置所有状态
         self.progress_panel.show()
         self.progress_bar.setValue(0)
+        self.progress_log.clear()
+        self.stat_count_label.setText("已处理：0 / 0")
+        self.stat_speed_label.setText("速度：-- 文件/秒")
+        self.stat_eta_label.setText("剩余：计算中...")
+        self.stat_elapsed_label.setText("已用：0 秒")
+        self.progress_label.setText("正在扫描目录...")
         self.progress_title.setText(f"正在建立索引：{settings['root_dir']}")
+        self.stop_btn.setEnabled(True)
         self.search_btn.setEnabled(False)
+        # 启动计时器
+        import time as _time
+        self._index_start_time = _time.time()
+        self._elapsed_timer.start()
         self._update_status("索引中...")
 
     def _stop_indexing(self):
@@ -1063,16 +1164,61 @@ class MainWindow(QMainWindow):
             pct = int(current * 100 / total)
             self.progress_bar.setValue(pct)
             filename = os.path.basename(filepath)
-            self.progress_label.setText(
-                f"处理中 ({current}/{total})：{filename}"
-            )
+            # 显示当前文件（路径过长则截断显示）
+            if len(filepath) > 80:
+                display_path = '...' + filepath[-77:]
+            else:
+                display_path = filepath
+            self.progress_label.setText(f"当前：{display_path}")
+            self.stat_count_label.setText(f"已处理：{current} / {total}")
+
+    def _on_speed_update(self, speed: float, eta: float, current: int, total: int):
+        """速度和剩余时间更新"""
+        if speed > 0:
+            self.stat_speed_label.setText(f"速度：{speed:.1f} 文件/秒")
+        if eta > 0:
+            if eta < 60:
+                eta_str = f"{int(eta)} 秒"
+            elif eta < 3600:
+                eta_str = f"{int(eta // 60)} 分 {int(eta % 60)} 秒"
+            else:
+                h = int(eta // 3600)
+                m = int((eta % 3600) // 60)
+                eta_str = f"{h} 小时 {m} 分"
+            self.stat_eta_label.setText(f"剩余：{eta_str}")
+        else:
+            self.stat_eta_label.setText("剩余：即将完成")
+
+    def _update_elapsed_time(self):
+        """每秒更新已用时间"""
+        import time as _time
+        if self._index_start_time > 0:
+            elapsed = _time.time() - self._index_start_time
+            if elapsed < 60:
+                elapsed_str = f"{int(elapsed)} 秒"
+            elif elapsed < 3600:
+                elapsed_str = f"{int(elapsed // 60)} 分 {int(elapsed % 60)} 秒"
+            else:
+                h = int(elapsed // 3600)
+                m = int((elapsed % 3600) // 60)
+                elapsed_str = f"{h} 小时 {m} 分"
+            self.stat_elapsed_label.setText(f"已用：{elapsed_str}")
 
     def _on_index_log(self, msg: str):
-        """索引日志"""
+        """索引日志：同时显示在日志区和状态栏"""
         self._update_status(msg)
+        # 日志区显示最新消息
+        self.progress_log.append(msg)
+        # 自动滚动到底部
+        cursor = self.progress_log.textCursor()
+        cursor.movePosition(cursor.End)
+        self.progress_log.setTextCursor(cursor)
 
     def _on_index_finished(self, stats: Dict):
         """索引完成"""
+        self._elapsed_timer.stop()
+        import time as _time
+        total_elapsed = _time.time() - self._index_start_time if self._index_start_time > 0 else 0
         self.progress_panel.hide()
         self.search_btn.setEnabled(True)
 
@@ -1088,14 +1234,27 @@ class MainWindow(QMainWindow):
             "background: #E8F5E9; border-radius: 4px; padding: 3px 8px;"
         )
 
-        msg = (f"索引完成！共 {stats['total']} 个文件，"
-               f"新增 {stats['added']}，更新 {stats['updated']}，"
-               f"跳过 {stats['skipped']}，失败 {stats['failed']}")
-        self._update_status(msg)
+        # 格式化总耗时
+        if total_elapsed < 60:
+            elapsed_str = f"{total_elapsed:.1f} 秒"
+        elif total_elapsed < 3600:
+            elapsed_str = f"{int(total_elapsed // 60)} 分 {int(total_elapsed % 60)} 秒"
+        else:
+            h = int(total_elapsed // 3600)
+            m = int((total_elapsed % 3600) // 60)
+            elapsed_str = f"{h} 小时 {m} 分"
+
+        avg_speed = stats['total'] / total_elapsed if total_elapsed > 0 else 0
+        msg = (f"索引完成！共 {stats['total']} 个文件\n"
+               f"新增 {stats['added']} 个，更新 {stats['updated']} 个，"
+               f"跳过 {stats['skipped']} 个，失败 {stats['failed']} 个\n"
+               f"总耗时：{elapsed_str}，平均速度：{avg_speed:.1f} 文件/秒")
+        self._update_status(msg.replace('\n', ' '))
         QMessageBox.information(self, "索引完成", msg)
 
     def _on_index_error(self, error: str):
         """索引出错"""
+        self._elapsed_timer.stop()
         self.progress_panel.hide()
         self.search_btn.setEnabled(True)
         QMessageBox.critical(self, "索引出错", f"索引过程中发生错误：\n{error}")
