@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-索引引擎模块 v1.3 - 性能优化版
+索引引擎模块 v1.4 - 性能优化版
 使用 SQLite FTS5 unicode61 分词器（直接支持中文字符，无需 jieba 预分词）
 
 核心优化：
@@ -217,9 +217,19 @@ class IndexEngine:
             cursor.execute("DELETE FROM documents WHERE id=?", (doc_id,))
             conn.commit()
 
+    @staticmethod
+    def _escape_fts_query(query: str) -> str:
+        """转义 FTS5 特殊字符，避免查询语法错误"""
+        # FTS5 特殊字符：" * ^ ( ) NOT AND OR
+        # 用双引号包裹整个短语是最安全的方式
+        # 只需要转义内部的双引号
+        escaped = query.replace('"', '""')
+        return f'"{escaped}"'
+
     def search(self, query: str, limit: int = 200) -> List[Dict]:
         """
         搜索文档（支持中文关键词直接搜索，无需分词）
+        三级搜索策略：精确短语 -> 分词 OR -> LIKE 兜底
         """
         if not query.strip():
             return []
@@ -228,14 +238,11 @@ class IndexEngine:
         cursor = conn.cursor()
 
         query = query.strip()
-
-        # FTS5 查询：支持短语搜索和多词搜索
-        # 先尝试精确短语搜索，再尝试分字搜索
         results = []
 
-        # 方式1：整体作为短语搜索
+        # 方式1：整体作为精确短语搜索（最准确）
         try:
-            fts_query = f'"{query}"'
+            fts_query = self._escape_fts_query(query)
             cursor.execute('''
                 SELECT d.id, d.filepath, d.filename, d.extension,
                        d.filesize, d.modified_time, d.content, d.index_root
@@ -249,10 +256,28 @@ class IndexEngine:
         except sqlite3.OperationalError:
             results = []
 
-        # 方式2：如果短语搜索无结果，改为逐字符 OR 搜索（适合单字搜索）
+        # 方式2：多词空格分隔搜索（每个词独立匹配，AND 逻辑）
+        if not results and ' ' in query:
+            try:
+                words = query.split()
+                fts_parts = [self._escape_fts_query(w) for w in words if w.strip()]
+                fts_query = ' AND '.join(fts_parts)
+                cursor.execute('''
+                    SELECT d.id, d.filepath, d.filename, d.extension,
+                           d.filesize, d.modified_time, d.content, d.index_root
+                    FROM documents d
+                    JOIN documents_fts fts ON d.id = fts.rowid
+                    WHERE documents_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                ''', (fts_query, limit))
+                results = cursor.fetchall()
+            except sqlite3.OperationalError:
+                results = []
+
+        # 方式3：如果短语搜索无结果，改为逐字符 OR 搜索（适合单字搜索）
         if not results and len(query) <= 4:
             try:
-                # 把每个字作为独立词搜索
                 chars = [f'"{c}"' for c in query if c.strip()]
                 if chars:
                     fts_query = ' OR '.join(chars)
@@ -269,7 +294,7 @@ class IndexEngine:
             except sqlite3.OperationalError:
                 results = []
 
-        # 方式3：降级为 LIKE 搜索（兜底）
+        # 方式4：降级为 LIKE 搜索（兜底，确保不漏）
         if not results:
             like_query = f'%{query}%'
             cursor.execute('''
@@ -302,7 +327,7 @@ class IndexEngine:
         return output
 
     def _extract_snippets(self, content: str, query: str) -> List[str]:
-        """从文档内容中提取包含关键词的上下文摘要"""
+        """从文档内容中提取包含关键词的上下文摘要（大小写不敏感）"""
         if not content or not query:
             return []
 
@@ -317,6 +342,7 @@ class IndexEngine:
             if idx == -1:
                 break
 
+            # 防止同一位置附近重复摘要
             bucket = idx // SNIPPET_CONTEXT
             if bucket in seen_positions:
                 pos = idx + 1
@@ -325,18 +351,30 @@ class IndexEngine:
 
             start = max(0, idx - SNIPPET_CONTEXT // 2)
             end = min(len(content), idx + len(query) + SNIPPET_CONTEXT // 2)
-            snippet = content[start:end].strip()
 
-            # 高亮关键词
-            snippet = snippet.replace(query, f'**{query}**')
-            snippet = snippet.replace(query_lower, f'**{query_lower}**')
+            # 尽量在词边界截断（避免截断中文词）
+            snippet = content[start:end].strip()
+            # 清理多余空白行
+            snippet = ' '.join(snippet.split())
+
+            # 高亮关键词（大小写不敏感替换）
+            import re
+            try:
+                highlighted = re.sub(
+                    re.escape(query),
+                    f'**{query}**',
+                    snippet,
+                    flags=re.IGNORECASE
+                )
+            except re.error:
+                highlighted = snippet.replace(query, f'**{query}**')
 
             if start > 0:
-                snippet = '...' + snippet
+                highlighted = '...' + highlighted
             if end < len(content):
-                snippet = snippet + '...'
+                highlighted = highlighted + '...'
 
-            snippets.append(snippet)
+            snippets.append(highlighted)
             pos = idx + 1
 
         return snippets
@@ -348,6 +386,23 @@ class IndexEngine:
         cursor.execute("SELECT content FROM documents WHERE id=?", (doc_id,))
         row = cursor.fetchone()
         return row[0] if row else None
+
+    def cleanup_orphans(self):
+        """清理孤立记录：删除磁盘上已不存在的文件的索引"""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, filepath FROM documents")
+        rows = cursor.fetchall()
+        deleted = 0
+        for doc_id, filepath in rows:
+            if not os.path.exists(filepath):
+                cursor.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
+                cursor.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+                deleted += 1
+        if deleted > 0:
+            conn.commit()
+            logger.info(f"清理孤立记录：删除 {deleted} 条")
+        return deleted
 
     def optimize(self):
         """优化 FTS5 索引（索引完成后调用，加速搜索）"""

@@ -29,6 +29,7 @@ from PyQt5.QtGui import (
     QFont, QIcon, QColor, QPalette, QPixmap,
     QTextCharFormat, QTextCursor
 )
+from PyQt5.QtGui import QTextDocument
 
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,7 +37,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -477,27 +478,29 @@ class OfflinePreviewDialog(QDialog):
             self.full_content_loaded = True
 
     def _highlight_keywords(self, query: str):
-        """在全文中高亮显示关键词"""
+        """在全文中高亮显示关键词（不依赖 jieba，直接字符串搜索）"""
         if not query:
             return
         fmt = QTextCharFormat()
         fmt.setBackground(QColor('#FFF176'))
         fmt.setForeground(QColor('#E65100'))
+        fmt.setFontWeight(QFont.Bold)
 
         cursor = self.full_text_edit.textCursor()
         cursor.movePosition(QTextCursor.Start)
         self.full_text_edit.setTextCursor(cursor)
 
-        import jieba
-        words = list(jieba.cut(query, cut_all=False))
-        words = [w for w in words if w.strip() and len(w) > 1]
+        # 直接搜索关键词本身，不需要分词
+        # 同时也搜索空格分隔的各个单词
+        words = [query] + [w for w in query.split() if w.strip() and w != query]
 
         doc = self.full_text_edit.document()
         for word in words:
-            cursor = doc.find(word)
+            find_flags = QTextDocument.FindFlags()
+            cursor = doc.find(word, 0, find_flags)
             while not cursor.isNull():
                 cursor.mergeCharFormat(fmt)
-                cursor = doc.find(word, cursor)
+                cursor = doc.find(word, cursor, find_flags)
 
     def _format_size(self, size: int) -> str:
         if size < 1024:
@@ -811,6 +814,9 @@ class MainWindow(QMainWindow):
         self.result_tree.itemClicked.connect(self._on_result_clicked)
         self.result_tree.itemDoubleClicked.connect(self._on_result_double_clicked)
         self.result_tree.setToolTip("单击查看摘要，双击打开文件（文件不存在时显示离线预览）")
+        # 开启右键菜单
+        self.result_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.result_tree.customContextMenuRequested.connect(self._show_result_context_menu)
         layout.addWidget(self.result_tree, 1)
 
         # 空状态提示
@@ -1001,6 +1007,11 @@ class MainWindow(QMainWindow):
         update_index_action.triggered.connect(self._update_index)
         index_menu.addAction(update_index_action)
 
+        cleanup_action = QAction("清理孤立记录", self)
+        cleanup_action.setToolTip("删除已不存在的文件的索引记录")
+        cleanup_action.triggered.connect(self._cleanup_orphans)
+        index_menu.addAction(cleanup_action)
+
         index_menu.addSeparator()
 
         exit_action = QAction("退出", self)
@@ -1015,6 +1026,24 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     # ─── 索引操作 ─────────────────────────────────────────────────────────────
+
+    def _cleanup_orphans(self):
+        """手动清理孤立记录（删除已不存在的文件的索引记录）"""
+        if not self.engine:
+            QMessageBox.information(self, "提示", "请先加载一个索引")
+            return
+        try:
+            deleted = self.engine.cleanup_orphans()
+            info = self.engine.get_index_info()
+            total = info.get('total_docs', 0)
+            QMessageBox.information(
+                self, "清理完成",
+                f"共删除 {deleted} 条孤立记录（文件已不存在）\n"
+                f"当前索引共 {total} 个文档"
+            )
+            self._refresh_index_info()
+        except Exception as e:
+            QMessageBox.critical(self, "清理失败", f"清理孤立记录时出错：\n{e}")
 
     def _new_index(self):
         """新建索引"""
@@ -1092,6 +1121,14 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self._new_index()
             return
+
+        # 更新前先清理孤立记录（删除已不存在的文件的索引）
+        try:
+            deleted = self.engine.cleanup_orphans()
+            if deleted > 0:
+                self._update_status(f"已清理 {deleted} 条孤立记录")
+        except Exception:
+            pass
 
         # 使用上次的设置
         settings = {
@@ -1546,14 +1583,59 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _show_result_context_menu(self, pos):
+        """显示搜索结果右键菜单"""
+        item = self.result_tree.itemAt(pos)
+        if not item:
+            return
+        result = item.data(0, Qt.UserRole)
+        if not result:
+            return
+
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+
+        file_exists = result.get('file_exists', False)
+
+        open_action = menu.addAction("打开文件")
+        open_action.setEnabled(file_exists)
+        open_action.triggered.connect(lambda: self._open_file(result['filepath']))
+
+        folder_action = menu.addAction("打开所在文件夹")
+        folder_action.setEnabled(file_exists)
+        folder_action.triggered.connect(
+            lambda: self._open_folder(os.path.dirname(result['filepath']))
+        )
+
+        menu.addSeparator()
+
+        preview_action = menu.addAction("离线预览")
+        preview_action.triggered.connect(lambda: self._show_offline_preview(result))
+
+        menu.addSeparator()
+
+        copy_path_action = menu.addAction("复制完整路径")
+        copy_path_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(result['filepath'])
+        )
+
+        copy_name_action = menu.addAction("复制文件名")
+        copy_name_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(result['filename'])
+        )
+
+        menu.exec_(self.result_tree.viewport().mapToGlobal(pos))
+
     def _show_about(self):
         QMessageBox.about(
             self, f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b> v{APP_VERSION}<br><br>"
             "一款快速的文档全文搜索索引工具<br>"
             "支持 Word、Excel、PowerPoint、PDF 格式<br>"
-            "使用 SQLite FTS5 + jieba 中文分词<br><br>"
-            "双击结果：文件存在则打开，不存在则离线预览"
+            "使用 SQLite FTS5 全文索引，支持中英文搜索<br><br>"
+            "单击结果：查看关键词命中摘要<br>"
+            "双击结果：文件存在则打开，不存在则离线预览<br>"
+            "右键结果：复制路径、打开文件夹等快捷操作"
         )
 
     def closeEvent(self, event):
