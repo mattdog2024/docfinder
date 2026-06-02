@@ -26,11 +26,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 3. 安装依赖
+      # 3. 安装依赖（不含 jieba，FTS5 unicode61 直接支持中文）
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install python-docx openpyxl python-pptx pdfplumber xlrd jieba PyQt5 pyinstaller
+          pip install python-docx openpyxl python-pptx pdfplumber xlrd docx2txt PyQt5 pyinstaller
 
       # 4. 获取版本号（从 tag 或默认值）
       - name: Get version
@@ -45,7 +45,7 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Build version: ${VERSION}"
 
-      # 5. 用 PyInstaller 打包成单个 exe
+      # 5. 用 PyInstaller 打包成单个 exe（带图标）
       - name: Build EXE with PyInstaller
         run: |
           python -m PyInstaller `
@@ -53,9 +53,8 @@ jobs:
             --onefile `
             --windowed `
             --name "DocFinder_${{ steps.get_version.outputs.VERSION }}" `
-            --hidden-import jieba `
-            --hidden-import jieba.analyse `
-            --hidden-import jieba.posseg `
+            --icon "assets\logo_icon.ico" `
+            --add-data "assets;assets" `
             --hidden-import docx `
             --hidden-import docx.oxml `
             --hidden-import openpyxl `
@@ -64,11 +63,11 @@ jobs:
             --hidden-import pptx.util `
             --hidden-import pdfplumber `
             --hidden-import xlrd `
+            --hidden-import docx2txt `
             --hidden-import PyQt5 `
             --hidden-import PyQt5.QtWidgets `
             --hidden-import PyQt5.QtCore `
             --hidden-import PyQt5.QtGui `
-            --collect-data jieba `
             --exclude-module matplotlib `
             --exclude-module numpy `
             --exclude-module scipy `
@@ -113,13 +112,20 @@ jobs:
             ### 系统要求
             - Windows 10 / Windows 11 64位
 
+            ### v1.5 主要改进
+            - **大幅提速**：docx/pptx 改用直接解析 XML，速度提升 3-5 倍；xlsx 限制读取行数，避免超大表格卡死
+            - **标题 Logo**：修复标题文字显示异常，加入软件图标（任务栏/标题栏/EXE 图标）
+            - **线程数优化**：默认使用 CPU 核心数 × 2 的线程，充分利用多核
+            - **内容截断优化**：每文件最多提取 5 万字（原 10 万），减少内存占用，提升速度
+            - **速度回调改进**：滑动窗口算法，速度和剩余时间显示更准确
+
             ### 功能特性
             - 支持 doc / docx / xls / xlsx / ppt / pptx / PDF 全文索引
             - SQLite FTS5 全文索引，支持中英文搜索，毫秒级搜索
             - 离线搜索：索引保存为 .db 文件，硬盘不在也能搜索
             - 离线预览：关键词命中段落 + 查看全文
-            - 多线程并行索引，增量更新
-            - 明亮风格图形界面
+            - 多线程并行索引，增量更新，自动跳过未变化文件
+            - 明亮风格图形界面，右键菜单，进度面板
 
             ### 使用方法
             1. 双击 exe 运行

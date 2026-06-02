@@ -469,13 +469,18 @@ class IndexBuilder:
         enabled_extensions: List[str],
         enable_pdf: bool = True,
         enable_ocr: bool = False,
-        max_workers: int = 4,
+        max_workers: int = None,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
+        speed_callback: Optional[Callable] = None,
     ) -> Dict:
         """
-        构建/更新索引（v1.3 优化版）
+        构建/更新索引（v1.5 优化版）
+        speed_callback(speed_per_sec, eta_seconds) 用于进度面板显示速度和剩余时间
         """
+        import multiprocessing
+        if max_workers is None:
+            max_workers = min(multiprocessing.cpu_count() * 2, 16)
         self._stop_flag.clear()
 
         def log(msg):
@@ -524,6 +529,8 @@ class IndexBuilder:
 
         processed = 0
         lock = threading.Lock()
+        start_time = time.time()
+        recent_done_times = []  # 滑动窗口计算速度
 
         # 批量缓冲区
         batch_buffer = []
@@ -556,6 +563,20 @@ class IndexBuilder:
 
                 if progress_callback:
                     progress_callback(processed + skipped, total, filepath)
+
+                # 速度计算（滑动窗口最近 30 个文件）
+                if speed_callback:
+                    now = time.time()
+                    recent_done_times.append(now)
+                    if len(recent_done_times) > 30:
+                        recent_done_times.pop(0)
+                    if len(recent_done_times) >= 2:
+                        window = recent_done_times[-1] - recent_done_times[0]
+                        if window > 0:
+                            spd = (len(recent_done_times) - 1) / window
+                            remaining = len(to_process) - processed
+                            eta = remaining / spd if spd > 0 else 0
+                            speed_callback(spd, eta)
 
             # 达到批量大小时写入
             flush_batch(force=False)

@@ -37,7 +37,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -335,6 +335,11 @@ class IndexWorker(QThread):
         self._last_time = self._start_time
         self._last_count = 0
         try:
+            def _speed_cb(spd, eta):
+                cur = self._last_count
+                tot = 0  # total not needed here, already tracked in progress
+                self.speed_update.emit(spd, eta, cur, 0)
+
             stats = self.builder.build_index(
                 root_dir=self.root_dir,
                 enabled_extensions=self.enabled_exts,
@@ -343,6 +348,7 @@ class IndexWorker(QThread):
                 max_workers=self.max_workers,
                 progress_callback=self._on_progress,
                 log_callback=lambda msg: self.log_msg.emit(msg),
+                speed_callback=_speed_cb,
             )
             self.finished.emit(stats)
         except Exception as e:
@@ -739,15 +745,29 @@ class MainWindow(QMainWindow):
 
         # 标题行
         title_row = QHBoxLayout()
-        title_label = QLabel(APP_NAME)
+        title_row.setSpacing(8)
+
+        # Logo 图标
+        logo_label = QLabel()
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 'assets', 'logo_icon.png')
+        if os.path.exists(logo_path):
+            pix = QPixmap(logo_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(pix)
+        else:
+            logo_label.setText("🔍")
+        logo_label.setFixedSize(36, 36)
+        title_row.addWidget(logo_label)
+
+        # 标题文字：用 HTML 渲染，强制指定字体，彻底避免字体回退问题
+        title_label = QLabel()
         title_label.setObjectName("label_title")
-        # 强制指定微软雅黑字体，避免 Windows 字体回退导致汉字显示异常
-        title_font = QFont()
-        title_font.setFamily("Microsoft YaHei")
-        title_font.setPointSize(16)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        title_label.setStyleSheet("color: #1976D2; font-family: 'Microsoft YaHei', '微软雅黑';")
+        title_label.setText(
+            f'<span style="font-family: Microsoft YaHei, 微软雅黑, SimHei, Arial; '
+            f'font-size: 16pt; font-weight: bold; color: #1976D2;">'
+            f'{APP_NAME}</span>'
+        )
+        title_label.setTextFormat(Qt.RichText)
         title_row.addWidget(title_label)
         title_row.addStretch()
 

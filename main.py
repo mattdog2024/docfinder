@@ -16,7 +16,7 @@ if sys.platform == 'win32':
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 
 # 添加项目根目录到路径（便携版兼容）
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +55,17 @@ def main():
     # 应用样式表
     app.setStyleSheet(STYLE_SHEET)
 
+    # 设置应用图标
+    icon_path = os.path.join(_base_dir, 'assets', 'logo_icon.ico')
+    if not os.path.exists(icon_path):
+        icon_path = os.path.join(_base_dir, 'assets', 'logo_icon.png')
+    if os.path.exists(icon_path):
+        app_icon = QIcon(icon_path)
+        app.setWindowIcon(app_icon)
+
     window = MainWindow()
+    if os.path.exists(icon_path):
+        window.setWindowIcon(QIcon(icon_path))
     window.show()
 
     sys.exit(app.exec_())
