@@ -38,7 +38,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.9"
+APP_VERSION = "2.0"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -801,14 +801,22 @@ class MainWindow(QMainWindow):
         logo_label.setFixedSize(36, 36)
         title_row.addWidget(logo_label)
 
-        # 标题文字：直接用 QLabel 显示文字，不依赖图片文件
-        # 这是最可靠的方式，Qt 会自动使用系统字体
+        # 标题文字：用 QFont 对象直接设置字体，避免 CSS 字体名解析问题
+        # 注意：不要在 CSS 里用中文字体名，Qt 的 CSS 解析器可能出错
         title_label = QLabel(APP_NAME)
         title_label.setObjectName("label_title")
-        title_label.setStyleSheet(
-            "color: #1565C0; font-size: 20px; font-weight: bold;"
-            "font-family: '微软雅黑', 'Microsoft YaHei', 'SimHei', '黑体', sans-serif;"
-        )
+        # 用 QFont 对象设置字体（比 CSS 更可靠）
+        title_font = QFont()
+        # 按优先级尝试字体
+        for font_name in ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'Arial']:
+            title_font.setFamily(font_name)
+            from PyQt5.QtGui import QFontInfo
+            if QFontInfo(title_font).family().lower() != 'arial' or font_name == 'Arial':
+                break
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setStyleSheet("color: #1565C0;")
         title_row.addWidget(title_label)
         title_row.addStretch()
 
@@ -1488,7 +1496,22 @@ class MainWindow(QMainWindow):
         snippets = result.get('snippets', [])
 
         if not snippets:
-            self.snippet_text.setPlainText("未找到关键词命中段落")
+            # 根据文件类型显示不同的提示
+            filepath = result.get('filepath', '')
+            ext = os.path.splitext(filepath)[1].lower() if filepath else ''
+            if ext == '.doc':
+                msg = (
+                    "未找到关键词命中段落\n\n"
+                    "该文件为 .doc 老格式（Word 97-2003）\n"
+                    "如果您安装了 Microsoft Word 或 LibreOffice，\n"
+                    "重新建立索引后即可显示摘要\n\n"
+                    "提示：建议将 .doc 文件转换为 .docx 格式"
+                )
+            elif ext in ('.xls', '.xlsx'):
+                msg = "未找到关键词命中单元格\n该文件为 Excel 格式，内容已建立索引但无段落摘要"
+            else:
+                msg = "未找到关键词命中段落\n该文件内容可能为空或无法提取"
+            self.snippet_text.setPlainText(msg)
             return
 
         html_parts = [

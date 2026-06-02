@@ -88,40 +88,155 @@ def extract_docx(filepath: str) -> str:
 # ─────────────────────────────────────────────
 
 def extract_doc(filepath: str) -> str:
-    """提取 .doc 文件文本"""
+    """
+    提取 .doc 文件文本（Word 97-2003 OLE 格式）
+    
+    按优先级尝试以下方案：
+    1. win32com（Windows + Word 已安装，最可靠）
+    2. LibreOffice 转换（需要安装 LibreOffice）
+    3. olefile 扫描 Unicode 字符（纯 Python 兜底）
+    """
     if not _check_file(filepath):
         return ''
 
-    # 方式1：docx2txt（纯 Python，速度快）
+    # 方式1：win32com 调用 Word（Windows 上最可靠，支持所有 .doc 版本）
     try:
-        import docx2txt
-        text = docx2txt.process(filepath)
-        if text and len(text.strip()) > 20:
-            return text[:MAX_CONTENT_CHARS]
+        import win32com.client
+        import tempfile
+        word = win32com.client.Dispatch('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = False
+        try:
+            doc = word.Documents.Open(
+                os.path.abspath(filepath),
+                ReadOnly=True,
+                AddToRecentFiles=False
+            )
+            text = doc.Content.Text
+            doc.Close(False)
+            if text and len(text.strip()) > 10:
+                return text[:MAX_CONTENT_CHARS]
+        finally:
+            word.Quit()
     except Exception:
         pass
 
-    # 方式2：尝试用 python-docx 直接读（部分 .doc 可以）
-    try:
-        from docx import Document
-        doc = Document(filepath)
-        parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        if parts:
-            return '\n'.join(parts)[:MAX_CONTENT_CHARS]
-    except Exception:
-        pass
-
-    # 方式3：antiword（需要系统安装）
+    # 方式2：LibreOffice 转换为 txt（跨平台，需要安装 LibreOffice）
     try:
         import subprocess
-        result = subprocess.run(
-            ['antiword', filepath],
-            capture_output=True, timeout=15
-        )
-        if result.returncode == 0:
-            text = result.stdout.decode('utf-8', errors='ignore')
-            if len(text.strip()) > 20:
-                return text[:MAX_CONTENT_CHARS]
+        import tempfile
+        import sys
+        
+        # 查找 LibreOffice 可执行文件（Windows 和 Linux 路径）
+        soffice_paths = [
+            'soffice',
+            'libreoffice',
+            r'C:\Program Files\LibreOffice\program\soffice.exe',
+            r'C:\Program Files (x86)\LibreOffice\program\soffice.exe',
+        ]
+        # 如果是 PyInstaller 打包的 exe，也查找同目录下的 soffice
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+            soffice_paths.insert(0, os.path.join(exe_dir, 'soffice.exe'))
+            soffice_paths.insert(0, os.path.join(exe_dir, 'LibreOffice', 'program', 'soffice.exe'))
+        
+        soffice_cmd = None
+        for path in soffice_paths:
+            try:
+                r = subprocess.run([path, '--version'], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    soffice_cmd = path
+                    break
+            except Exception:
+                continue
+        
+        if soffice_cmd:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = subprocess.run(
+                    [soffice_cmd, '--headless', '--convert-to', 'txt:Text',
+                     '--outdir', tmpdir, filepath],
+                    capture_output=True, timeout=30
+                )
+                base = os.path.splitext(os.path.basename(filepath))[0]
+                txt_path = os.path.join(tmpdir, base + '.txt')
+                if os.path.exists(txt_path):
+                    # LibreOffice 输出可能是 UTF-8 或 UTF-16
+                    for enc in ['utf-8-sig', 'utf-8', 'utf-16', 'gbk', 'gb2312']:
+                        try:
+                            with open(txt_path, 'r', encoding=enc, errors='ignore') as f:
+                                text = f.read(MAX_CONTENT_CHARS)
+                            if text and len(text.strip()) > 10:
+                                return text
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+
+    # 方式3：olefile 扫描 Unicode 中文字符（纯 Python 兜底，可能有少量乱码）
+    try:
+        import olefile
+        import struct
+        
+        if not olefile.isOleFile(filepath):
+            return ''
+        
+        ole = olefile.OleFileIO(filepath)
+        
+        # 读取 WordDocument 流
+        if not ole.exists('WordDocument'):
+            ole.close()
+            return ''
+        
+        wd_data = ole.openstream('WordDocument').read()
+        
+        # 判断使用哪个 Table 流
+        flags = struct.unpack_from('<H', wd_data, 10)[0]
+        use_1table = bool(flags & 0x0200)
+        table_name = '1Table' if use_1table else '0Table'
+        
+        if ole.exists(table_name):
+            table_data = ole.openstream(table_name).read()
+        else:
+            table_data = wd_data
+        
+        ole.close()
+        
+        # 扫描 UTF-16LE 中文字符
+        texts = []
+        current = []
+        
+        for data in [table_data, wd_data]:
+            i = 0
+            while i < len(data) - 1:
+                c = struct.unpack_from('<H', data, i)[0]
+                if (0x4E00 <= c <= 0x9FFF or   # CJK 统一汉字
+                    0x3400 <= c <= 0x4DBF or   # CJK 扩展A
+                    0x0020 <= c <= 0x007E or   # ASCII 可打印字符
+                    0x3000 <= c <= 0x303F or   # CJK 标点
+                    0xFF00 <= c <= 0xFFEF or   # 全角字符
+                    0x2000 <= c <= 0x206F):    # 通用标点
+                    current.append(chr(c))
+                else:
+                    if len(current) >= 5:
+                        texts.append(''.join(current))
+                    current = []
+                i += 2
+            if len(current) >= 5:
+                texts.append(''.join(current))
+            current = []
+        
+        # 去重并合并
+        seen = set()
+        unique_texts = []
+        for t in texts:
+            t_clean = t.strip()
+            if t_clean and t_clean not in seen and len(t_clean) >= 3:
+                seen.add(t_clean)
+                unique_texts.append(t_clean)
+        
+        result = ' '.join(unique_texts)
+        if len(result.strip()) > 10:
+            return result[:MAX_CONTENT_CHARS]
     except Exception:
         pass
 
