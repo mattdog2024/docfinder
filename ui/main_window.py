@@ -37,7 +37,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -609,11 +609,11 @@ class IndexSettingsDialog(QDialog):
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 16)
         import os as _os
-        default_workers = max(4, _os.cpu_count() or 4)
+        default_workers = min(_os.cpu_count() or 4, 16)
         self.thread_spin.setValue(self.settings.get('max_workers', default_workers))
         self.thread_spin.setMaximumWidth(80)
         thread_layout.addWidget(self.thread_spin)
-        thread_layout.addWidget(QLabel("（推荐 4，CPU 核心数多可适当增加）"))
+        thread_layout.addWidget(QLabel(f"（自动检测：{default_workers} 核，可根据需要调整）"))
         thread_layout.addStretch()
         layout.addWidget(thread_group)
 
@@ -749,25 +749,35 @@ class MainWindow(QMainWindow):
 
         # Logo 图标
         logo_label = QLabel()
-        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                 'assets', 'logo_icon.png')
+        assets_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets')
+        logo_path = os.path.join(assets_dir, 'logo_icon.png')
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(pix)
         else:
-            logo_label.setText("🔍")
+            logo_label.setText("D")
         logo_label.setFixedSize(36, 36)
         title_row.addWidget(logo_label)
 
-        # 标题文字：用 HTML 渲染，强制指定字体，彻底避免字体回退问题
+        # 标题文字：优先用图片（彻底避免字体乱码），回退到 QFont 方式
         title_label = QLabel()
         title_label.setObjectName("label_title")
-        title_label.setText(
-            f'<span style="font-family: Microsoft YaHei, 微软雅黑, SimHei, Arial; '
-            f'font-size: 16pt; font-weight: bold; color: #1976D2;">'
-            f'{APP_NAME}</span>'
-        )
-        title_label.setTextFormat(Qt.RichText)
+        title_img_path = os.path.join(assets_dir, 'title_text.png')
+        if os.path.exists(title_img_path):
+            # 用图片显示标题，完全不依赖字体，100% 不会乱码
+            title_pix = QPixmap(title_img_path)
+            title_label.setPixmap(title_pix)
+            title_label.setFixedHeight(36)
+        else:
+            # 回退方案：直接用 QFont 设置（不用样式表，避免覆盖）
+            from PyQt5.QtGui import QFont as _QFont
+            f = _QFont()
+            f.setFamily('Microsoft YaHei')
+            f.setPointSize(16)
+            f.setBold(True)
+            title_label.setFont(f)
+            title_label.setText(APP_NAME)
+            title_label.setStyleSheet('color: #1565C0;')
         title_row.addWidget(title_label)
         title_row.addStretch()
 
@@ -1075,7 +1085,7 @@ class MainWindow(QMainWindow):
                 ['.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt']
             ),
             'enable_ocr': self.qsettings.value('enable_ocr', False, type=bool),
-            'max_workers': self.qsettings.value('max_workers', 4, type=int),
+            'max_workers': self.qsettings.value('max_workers', min(multiprocessing.cpu_count(), 16), type=int),
         }
 
         dlg = IndexSettingsDialog(self, last_settings)
@@ -1181,7 +1191,7 @@ class MainWindow(QMainWindow):
             enabled_exts=settings['enabled_extensions'],
             enable_pdf=settings.get('enable_pdf', True),
             enable_ocr=settings.get('enable_ocr', False),
-            max_workers=settings.get('max_workers', 4),
+            max_workers=settings.get('max_workers', min(multiprocessing.cpu_count(), 16)),
         )
         self.index_worker.progress.connect(self._on_index_progress)
         self.index_worker.log_msg.connect(self._on_index_log)
@@ -1323,7 +1333,7 @@ class MainWindow(QMainWindow):
         self.qsettings.setValue('last_db_path', settings.get('db_path', ''))
         self.qsettings.setValue('enabled_extensions', settings.get('enabled_extensions', []))
         self.qsettings.setValue('enable_ocr', settings.get('enable_ocr', False))
-        self.qsettings.setValue('max_workers', settings.get('max_workers', 4))
+        self.qsettings.setValue('max_workers', settings.get('max_workers', min(multiprocessing.cpu_count(), 16)))
 
     # ─── 搜索操作 ─────────────────────────────────────────────────────────────
 

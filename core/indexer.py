@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-索引引擎模块 v1.4 - 性能优化版
-使用 SQLite FTS5 unicode61 分词器（直接支持中文字符，无需 jieba 预分词）
+索引引擎模块 v1.6 - 稳定性修复版
 
-核心优化：
-1. 批量写入（BATCH_SIZE 条一次 commit），从 4 万次 IO 降到几十次
-2. 去掉 jieba 预分词，FTS5 unicode61 直接处理中文，速度快 3-5 倍
-3. 优化 SQLite PRAGMA（WAL + 大缓存 + 关闭同步）
-4. 进程池替代线程池（绕过 Python GIL，CPU 密集型任务真正并行）
-5. 扫描阶段用 os.scandir 替代 os.walk，速度更快
+核心修复：
+1. 生产者-消费者模式：多线程只解析文件（生产者），主线程单独写入数据库（消费者）
+   彻底解决多线程并发写入 SQLite 导致的 disk I/O error
+2. 数据库连接改为单连接模式（不再使用 threading.local），更稳定
+3. 线程数默认值改为 CPU 核心数（自动检测）
 """
 
 import os
@@ -16,8 +14,10 @@ import sqlite3
 import time
 import logging
 import threading
+import queue
+import multiprocessing
 from typing import List, Dict, Optional, Callable
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -39,56 +39,31 @@ def get_file_hash(filepath: str) -> str:
         return ''
 
 
-def _extract_worker(args):
-    """
-    进程池工作函数（必须是模块级函数，不能是 lambda 或嵌套函数）
-    args: (filepath, enable_pdf, enable_ocr)
-    返回: (filepath, filename, ext, filesize, mtime, fhash, content) 或 None
-    """
-    filepath, enable_pdf, enable_ocr = args
-    try:
-        from core.extractor import extract_text
-        filename = os.path.basename(filepath)
-        ext = os.path.splitext(filename)[1].lower()
-        stat = os.stat(filepath)
-        filesize = stat.st_size
-        mtime = stat.st_mtime
-        fhash = f"{filesize}_{mtime}"
-        content = extract_text(filepath, enable_pdf=(enable_pdf and ext == '.pdf'),
-                               enable_ocr=enable_ocr)
-        return (filepath, filename, ext, filesize, mtime, fhash, content)
-    except Exception as e:
-        return None
-
-
 class IndexEngine:
     """
-    文档索引引擎（v1.3 优化版）
-    数据库结构：
-      - documents: 文件元数据 + 原始文本
-      - documents_fts: FTS5 虚拟表，unicode61 分词器直接处理中文
+    文档索引引擎（v1.6 稳定版）
+    使用单一数据库连接，所有写操作在同一线程中执行，避免并发写入问题
     """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._local = threading.local()
+        self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """获取线程本地的数据库连接"""
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._apply_pragmas(conn)
-            self._local.conn = conn
-        return self._local.conn
+        """获取数据库连接（单连接，非线程安全，调用方负责线程安全）"""
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._apply_pragmas(self._conn)
+        return self._conn
 
     def _apply_pragmas(self, conn: sqlite3.Connection):
         """应用性能优化 PRAGMA"""
-        conn.execute("PRAGMA journal_mode=WAL")       # WAL 模式，写入更快
-        conn.execute("PRAGMA synchronous=NORMAL")      # 减少磁盘同步次数
-        conn.execute("PRAGMA cache_size=-65536")       # 64MB 内存缓存
-        conn.execute("PRAGMA temp_store=MEMORY")       # 临时表放内存
-        conn.execute("PRAGMA mmap_size=268435456")     # 256MB 内存映射
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-65536")   # 64MB 内存缓存
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=268435456") # 256MB 内存映射
 
     def _init_db(self):
         """初始化数据库表结构"""
@@ -111,8 +86,6 @@ class IndexEngine:
             )
         ''')
 
-        # FTS5 使用 unicode61 分词器，直接支持中文字符搜索
-        # 不再需要 jieba 预分词，速度大幅提升
         cursor.execute('''
             CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts
             USING fts5(
@@ -161,7 +134,7 @@ class IndexEngine:
 
     def batch_add_documents(self, records: List[tuple], index_root: str):
         """
-        批量添加/更新文档（核心优化：一次 commit 写入多条）
+        批量添加/更新文档（必须在单一线程中调用）
         records: [(filepath, filename, ext, filesize, mtime, fhash, content), ...]
         """
         if not records:
@@ -172,7 +145,6 @@ class IndexEngine:
         now = time.time()
 
         for filepath, filename, ext, filesize, mtime, fhash, content in records:
-            # 检查是否已存在
             cursor.execute("SELECT id FROM documents WHERE filepath=?", (filepath,))
             row = cursor.fetchone()
 
@@ -202,7 +174,6 @@ class IndexEngine:
                     (doc_id, filepath, filename, content or '')
                 )
 
-        # 批量提交，大幅减少磁盘 IO
         conn.commit()
 
     def remove_document(self, filepath: str):
@@ -220,27 +191,23 @@ class IndexEngine:
     @staticmethod
     def _escape_fts_query(query: str) -> str:
         """转义 FTS5 特殊字符，避免查询语法错误"""
-        # FTS5 特殊字符：" * ^ ( ) NOT AND OR
-        # 用双引号包裹整个短语是最安全的方式
-        # 只需要转义内部的双引号
         escaped = query.replace('"', '""')
         return f'"{escaped}"'
 
     def search(self, query: str, limit: int = 200) -> List[Dict]:
         """
-        搜索文档（支持中文关键词直接搜索，无需分词）
-        三级搜索策略：精确短语 -> 分词 OR -> LIKE 兜底
+        搜索文档（支持中文关键词直接搜索）
+        三级搜索策略：精确短语 -> 多词AND -> LIKE 兜底
         """
         if not query.strip():
             return []
 
         conn = self._get_conn()
         cursor = conn.cursor()
-
         query = query.strip()
         results = []
 
-        # 方式1：整体作为精确短语搜索（最准确）
+        # 方式1：整体作为精确短语搜索
         try:
             fts_query = self._escape_fts_query(query)
             cursor.execute('''
@@ -256,7 +223,7 @@ class IndexEngine:
         except sqlite3.OperationalError:
             results = []
 
-        # 方式2：多词空格分隔搜索（每个词独立匹配，AND 逻辑）
+        # 方式2：多词空格分隔 AND 搜索
         if not results and ' ' in query:
             try:
                 words = query.split()
@@ -275,26 +242,7 @@ class IndexEngine:
             except sqlite3.OperationalError:
                 results = []
 
-        # 方式3：如果短语搜索无结果，改为逐字符 OR 搜索（适合单字搜索）
-        if not results and len(query) <= 4:
-            try:
-                chars = [f'"{c}"' for c in query if c.strip()]
-                if chars:
-                    fts_query = ' OR '.join(chars)
-                    cursor.execute('''
-                        SELECT d.id, d.filepath, d.filename, d.extension,
-                               d.filesize, d.modified_time, d.content, d.index_root
-                        FROM documents d
-                        JOIN documents_fts fts ON d.id = fts.rowid
-                        WHERE documents_fts MATCH ?
-                        ORDER BY rank
-                        LIMIT ?
-                    ''', (fts_query, limit))
-                    results = cursor.fetchall()
-            except sqlite3.OperationalError:
-                results = []
-
-        # 方式4：降级为 LIKE 搜索（兜底，确保不漏）
+        # 方式3：LIKE 兜底（确保不漏）
         if not results:
             like_query = f'%{query}%'
             cursor.execute('''
@@ -331,6 +279,7 @@ class IndexEngine:
         if not content or not query:
             return []
 
+        import re
         content_lower = content.lower()
         query_lower = query.lower()
         snippets = []
@@ -342,7 +291,6 @@ class IndexEngine:
             if idx == -1:
                 break
 
-            # 防止同一位置附近重复摘要
             bucket = idx // SNIPPET_CONTEXT
             if bucket in seen_positions:
                 pos = idx + 1
@@ -351,14 +299,9 @@ class IndexEngine:
 
             start = max(0, idx - SNIPPET_CONTEXT // 2)
             end = min(len(content), idx + len(query) + SNIPPET_CONTEXT // 2)
-
-            # 尽量在词边界截断（避免截断中文词）
             snippet = content[start:end].strip()
-            # 清理多余空白行
             snippet = ' '.join(snippet.split())
 
-            # 高亮关键词（大小写不敏感替换）
-            import re
             try:
                 highlighted = re.sub(
                     re.escape(query),
@@ -415,17 +358,19 @@ class IndexEngine:
 
     def close(self):
         """关闭数据库连接"""
-        if hasattr(self._local, 'conn') and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
 
 class IndexBuilder:
     """
-    索引构建器 v1.3 优化版
-    - 使用线程池并行提取文档内容
-    - 批量写入数据库（每 BATCH_SIZE 条提交一次）
-    - 快速扫描目录（os.scandir 递归）
+    索引构建器 v1.6 稳定版
+
+    架构：生产者-消费者模式
+    - 多个工作线程（生产者）：并行解析文档内容，结果放入队列
+    - 主写入线程（消费者）：从队列取数据，批量写入数据库
+    - 数据库写入永远只有一个线程，彻底避免 disk I/O error
     """
 
     def __init__(self, engine: IndexEngine):
@@ -449,7 +394,6 @@ class IndexBuilder:
                         if self._stop_flag.is_set():
                             break
                         if entry.is_dir(follow_symlinks=False):
-                            # 跳过隐藏目录和系统目录
                             if not entry.name.startswith('.') and entry.name not in (
                                 'System Volume Information', '$RECYCLE.BIN', 'Windows',
                                 'Program Files', 'Program Files (x86)'
@@ -475,12 +419,14 @@ class IndexBuilder:
         speed_callback: Optional[Callable] = None,
     ) -> Dict:
         """
-        构建/更新索引（v1.5 优化版）
-        speed_callback(speed_per_sec, eta_seconds) 用于进度面板显示速度和剩余时间
+        构建/更新索引（v1.6 生产者-消费者模式）
+
+        多线程解析文件 → 结果队列 → 单线程写入数据库
+        彻底解决多线程并发写入 SQLite 的 disk I/O error 问题
         """
-        import multiprocessing
         if max_workers is None:
-            max_workers = min(multiprocessing.cpu_count() * 2, 16)
+            max_workers = min(multiprocessing.cpu_count(), 16)
+
         self._stop_flag.clear()
 
         def log(msg):
@@ -490,7 +436,6 @@ class IndexBuilder:
 
         log(f"开始扫描目录: {root_dir}")
 
-        # 快速扫描文件
         ext_set = set(enabled_extensions)
         all_files = self._scan_files(root_dir, ext_set)
         total = len(all_files)
@@ -527,33 +472,42 @@ class IndexBuilder:
             self.engine.set_index_info('index_root', root_dir)
             return stats
 
+        # ── 生产者-消费者架构 ──────────────────────────────────────────────
+        # 结果队列：工作线程把解析结果放进来，写入线程从这里取
+        result_queue = queue.Queue(maxsize=max_workers * 4)
+        _SENTINEL = object()  # 哨兵值，通知写入线程结束
+
         processed = 0
-        lock = threading.Lock()
         start_time = time.time()
         recent_done_times = []  # 滑动窗口计算速度
 
-        # 批量缓冲区
-        batch_buffer = []
-        batch_lock = threading.Lock()
-
-        def flush_batch(force=False):
-            """将缓冲区批量写入数据库"""
-            with batch_lock:
-                if not batch_buffer:
-                    return
-                if force or len(batch_buffer) >= BATCH_SIZE:
-                    records = batch_buffer.copy()
-                    batch_buffer.clear()
-                    self.engine.batch_add_documents(records, root_dir)
-
-        def on_file_done(result, filepath):
+        # ── 写入线程（消费者）：唯一写入数据库的线程 ──────────────────────
+        def writer_thread():
+            """从队列取结果，批量写入数据库（单线程，无并发冲突）"""
             nonlocal processed
-            with lock:
-                processed += 1
-                is_update = filepath in indexed
+            batch = []
+
+            while True:
+                try:
+                    item = result_queue.get(timeout=2.0)
+                except queue.Empty:
+                    # 超时但还有未完成的任务，继续等
+                    if batch:
+                        self.engine.batch_add_documents(batch, root_dir)
+                        batch = []
+                    continue
+
+                if item is _SENTINEL:
+                    # 收到结束信号，写入剩余数据
+                    if batch:
+                        self.engine.batch_add_documents(batch, root_dir)
+                    break
+
+                fp, result = item
+                is_update = fp in indexed
+
                 if result:
-                    with batch_lock:
-                        batch_buffer.append(result)
+                    batch.append(result)
                     if is_update:
                         stats['updated'] += 1
                     else:
@@ -561,14 +515,17 @@ class IndexBuilder:
                 else:
                     stats['failed'] += 1
 
-                if progress_callback:
-                    progress_callback(processed + skipped, total, filepath)
+                processed += 1
 
-                # 速度计算（滑动窗口最近 30 个文件）
+                # 进度回调
+                if progress_callback:
+                    progress_callback(processed + skipped, total, fp)
+
+                # 速度计算（滑动窗口最近 50 个文件）
                 if speed_callback:
                     now = time.time()
                     recent_done_times.append(now)
-                    if len(recent_done_times) > 30:
+                    if len(recent_done_times) > 50:
                         recent_done_times.pop(0)
                     if len(recent_done_times) >= 2:
                         window = recent_done_times[-1] - recent_done_times[0]
@@ -578,19 +535,24 @@ class IndexBuilder:
                             eta = remaining / spd if spd > 0 else 0
                             speed_callback(spd, eta)
 
-            # 达到批量大小时写入
-            flush_batch(force=False)
+                # 达到批量大小时写入
+                if len(batch) >= BATCH_SIZE:
+                    self.engine.batch_add_documents(batch, root_dir)
+                    batch = []
 
-        # 使用线程池（对 IO 密集型任务效果好，且避免多进程的序列化开销）
+                result_queue.task_done()
+
+        # 启动写入线程
+        writer = threading.Thread(target=writer_thread, daemon=True)
+        writer.start()
+
+        # ── 工作线程池（生产者）：并行解析文件，结果放入队列 ──────────────
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_fp = {}
             for fp in to_process:
                 if self._stop_flag.is_set():
                     break
-                future = executor.submit(
-                    _extract_single,
-                    fp, enable_pdf, enable_ocr
-                )
+                future = executor.submit(_extract_single, fp, enable_pdf, enable_ocr)
                 future_to_fp[future] = fp
 
             for future in as_completed(future_to_fp):
@@ -599,19 +561,21 @@ class IndexBuilder:
                 fp = future_to_fp[future]
                 try:
                     result = future.result()
-                    on_file_done(result, fp)
                 except Exception as e:
-                    on_file_done(None, fp)
+                    result = None
                     log(f"处理失败: {os.path.basename(fp)} - {e}")
 
-        # 最后一批强制写入
-        flush_batch(force=True)
+                # 把结果放入队列（写入线程会处理）
+                result_queue.put((fp, result))
+
+        # 通知写入线程结束
+        result_queue.put(_SENTINEL)
+        writer.join(timeout=60)  # 等待写入线程完成
 
         # 索引完成后优化 FTS5
         log("正在优化索引...")
         self.engine.optimize()
 
-        # 更新索引信息
         self.engine.set_index_info('last_index_time', str(time.time()))
         self.engine.set_index_info('index_root', root_dir)
 
@@ -623,7 +587,7 @@ class IndexBuilder:
 
 def _extract_single(filepath: str, enable_pdf: bool, enable_ocr: bool):
     """
-    单文件提取函数（线程池工作函数）
+    单文件提取函数（线程池工作函数，只负责解析，不写数据库）
     返回 tuple 或 None（失败时）
     """
     try:
