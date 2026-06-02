@@ -9,6 +9,7 @@ import sys
 import time
 import threading
 import subprocess
+import multiprocessing
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -37,7 +38,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -787,36 +788,30 @@ class MainWindow(QMainWindow):
         logo_label.setFixedSize(36, 36)
         title_row.addWidget(logo_label)
 
-        # 标题文字：用 QPainter 在内存中直接绘制，彻底不依赖外部文件和字体
+        # 标题文字：优先加载打包的 title_text.png，失败则回退到 QPainter
         title_label = QLabel()
         title_label.setObjectName("label_title")
-        # 用 QPainter 在内存中绘制标题图片（完全不依赖字体）
-        from PyQt5.QtGui import QPainter, QColor, QFont as _QFont
-        _title_w, _title_h = 240, 36
-        _title_pix = QPixmap(_title_w, _title_h)
-        _title_pix.fill(Qt.transparent)
-        _tp = QPainter(_title_pix)
-        _tp.setRenderHint(QPainter.TextAntialiasing)
-        # 依次尝试各种中文字体
-        _font_ok = False
-        for _fname in ['Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', 'SimSun', '宋体', 'Arial']:
-            _f = _QFont(_fname, 18, _QFont.Bold)
+        
+        title_img_path = os.path.join(assets_dir, 'title_text.png')
+        if os.path.isfile(title_img_path):
+            _title_pix = QPixmap(title_img_path)
+            title_label.setPixmap(_title_pix)
+            title_label.setFixedSize(_title_pix.width(), _title_pix.height())
+        else:
+            # 回退方案：用 QPainter 在内存中绘制
+            from PyQt5.QtGui import QPainter, QColor, QFont as _QFont
+            _title_w, _title_h = 240, 36
+            _title_pix = QPixmap(_title_w, _title_h)
+            _title_pix.fill(Qt.transparent)
+            _tp = QPainter(_title_pix)
+            _tp.setRenderHint(QPainter.TextAntialiasing)
+            _f = _QFont('Microsoft YaHei', 18, _QFont.Bold)
             _tp.setFont(_f)
-            _fm = _tp.fontMetrics()
-            # 测试这个字体能否正确显示中文（宽度应该大于 50px）
-            if _fm.width('文档搜索') > 50:
-                _font_ok = True
-                break
-        if not _font_ok:
-            _f = _QFont()
-            _f.setPointSize(18)
-            _f.setBold(True)
-            _tp.setFont(_f)
-        _tp.setPen(QColor('#1565C0'))
-        _tp.drawText(0, 0, _title_w, _title_h, Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
-        _tp.end()
-        title_label.setPixmap(_title_pix)
-        title_label.setFixedSize(_title_w, _title_h)
+            _tp.setPen(QColor('#1565C0'))
+            _tp.drawText(0, 0, _title_w, _title_h, Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
+            _tp.end()
+            title_label.setPixmap(_title_pix)
+            title_label.setFixedSize(_title_w, _title_h)
         title_row.addWidget(title_label)
         title_row.addStretch()
 

@@ -46,6 +46,10 @@ jobs:
           echo "Build version: ${VERSION}"
 
       # 5. 用 PyInstaller 打包成单个 exe（带图标）
+
+      - name: Generate title image with Windows font
+        run: |
+          python -c "from PIL import Image, ImageDraw, ImageFont; import os; font = ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 22); img = Image.new('RGBA', (220, 40), (255,255,255,0)); draw = ImageDraw.Draw(img); draw.text((10, 8), '文档搜索索引', fill=(21,101,192,255), font=font); os.makedirs('assets', exist_ok=True); img.save('assets/title_text.png'); print('title_text.png generated')"
       - name: Build EXE with PyInstaller
         run: |
           python -m PyInstaller `
@@ -112,12 +116,10 @@ jobs:
             ### 系统要求
             - Windows 10 / Windows 11 64位
 
-            ### v1.5 主要改进
-            - **大幅提速**：docx/pptx 改用直接解析 XML，速度提升 3-5 倍；xlsx 限制读取行数，避免超大表格卡死
-            - **标题 Logo**：修复标题文字显示异常，加入软件图标（任务栏/标题栏/EXE 图标）
-            - **线程数优化**：默认使用 CPU 核心数 × 2 的线程，充分利用多核
-            - **内容截断优化**：每文件最多提取 5 万字（原 10 万），减少内存占用，提升速度
-            - **速度回调改进**：滑动窗口算法，速度和剩余时间显示更准确
+            ### v1.8 主要修复
+            - **修复新建索引崩溃**：修复 `multiprocessing` 模块未导入导致点击新建索引时程序直接崩溃的问题
+            - **修复标题乱码**：在 Windows 环境用微软雅黑字体预生成标题图片，彻底解决 Qt 字体回退导致的乱码问题
+            - **代码健壮性提升**：全面检查并修复了多处潜在错误
 
             ### 功能特性
             - 支持 doc / docx / xls / xlsx / ppt / pptx / PDF 全文索引
