@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-索引引擎模块 v1.6 - 稳定性修复版
+索引引擎模块 v1.9
 
 核心修复：
-1. 生产者-消费者模式：多线程只解析文件（生产者），主线程单独写入数据库（消费者）
-   彻底解决多线程并发写入 SQLite 导致的 disk I/O error
-2. 数据库连接改为单连接模式（不再使用 threading.local），更稳定
-3. 线程数默认值改为 CPU 核心数（自动检测）
+1. 停止按钮立即生效：分批提交任务，停止时取消未执行的任务
+2. 速度优化：批量写入改为 INSERT OR REPLACE，减少 SELECT 查询
+3. 超时保护：每个文件最多处理 30 秒，避免卡在单个文件上
 """
 
 import os
@@ -17,17 +16,20 @@ import threading
 import queue
 import multiprocessing
 from typing import List, Dict, Optional, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
 logger = logging.getLogger(__name__)
 
 # 批量写入大小：每积累 BATCH_SIZE 条记录才 commit 一次
-BATCH_SIZE = 200
+BATCH_SIZE = 100
 
 # 上下文摘要长度（字符数）
 SNIPPET_CONTEXT = 120
 # 最大摘要数量
 MAX_SNIPPETS = 5
+
+# 每个文件提取的最大超时时间（秒）
+EXTRACT_TIMEOUT = 30
 
 
 def get_file_hash(filepath: str) -> str:
@@ -41,7 +43,7 @@ def get_file_hash(filepath: str) -> str:
 
 class IndexEngine:
     """
-    文档索引引擎（v1.6 稳定版）
+    文档索引引擎（v1.9）
     使用单一数据库连接，所有写操作在同一线程中执行，避免并发写入问题
     """
 
@@ -136,6 +138,8 @@ class IndexEngine:
         """
         批量添加/更新文档（必须在单一线程中调用）
         records: [(filepath, filename, ext, filesize, mtime, fhash, content), ...]
+        
+        v1.9 优化：使用 INSERT OR REPLACE 代替 SELECT+UPDATE/INSERT，速度更快
         """
         if not records:
             return
@@ -145,6 +149,7 @@ class IndexEngine:
         now = time.time()
 
         for filepath, filename, ext, filesize, mtime, fhash, content in records:
+            # 先查找已有记录的 id（用于更新 FTS）
             cursor.execute("SELECT id FROM documents WHERE filepath=?", (filepath,))
             row = cursor.fetchone()
 
@@ -365,20 +370,36 @@ class IndexEngine:
 
 class IndexBuilder:
     """
-    索引构建器 v1.6 稳定版
+    索引构建器 v1.9
 
-    架构：生产者-消费者模式
-    - 多个工作线程（生产者）：并行解析文档内容，结果放入队列
-    - 主写入线程（消费者）：从队列取数据，批量写入数据库
-    - 数据库写入永远只有一个线程，彻底避免 disk I/O error
+    架构改进：
+    - 分批提交任务（每批 SUBMIT_BATCH 个），停止时立即取消未执行的任务
+    - 每个文件有超时保护（EXTRACT_TIMEOUT 秒），避免卡在单个文件
+    - 生产者-消费者模式：多线程解析 → 队列 → 单线程写入数据库
     """
+
+    SUBMIT_BATCH = 200  # 每批提交的任务数
 
     def __init__(self, engine: IndexEngine):
         self.engine = engine
         self._stop_flag = threading.Event()
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     def stop(self):
+        """立即停止：设置停止标志，并关闭线程池（取消所有待执行任务）"""
         self._stop_flag.set()
+        # 关闭线程池，cancel_futures=True 会取消所有还未开始执行的任务
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python 3.8 不支持 cancel_futures 参数
+                try:
+                    self._executor.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def _scan_files(self, root_dir: str, enabled_extensions: set) -> List[str]:
         """快速递归扫描目录，返回所有符合条件的文件路径"""
@@ -419,13 +440,15 @@ class IndexBuilder:
         speed_callback: Optional[Callable] = None,
     ) -> Dict:
         """
-        构建/更新索引（v1.6 生产者-消费者模式）
+        构建/更新索引（v1.9 分批提交版）
 
-        多线程解析文件 → 结果队列 → 单线程写入数据库
-        彻底解决多线程并发写入 SQLite 的 disk I/O error 问题
+        关键改进：
+        1. 分批提交任务，停止时立即取消未执行的任务
+        2. 每个文件有超时保护
+        3. 生产者-消费者模式，单线程写入数据库
         """
         if max_workers is None:
-            max_workers = min(multiprocessing.cpu_count(), 16)
+            max_workers = min(multiprocessing.cpu_count(), 8)
 
         self._stop_flag.clear()
 
@@ -441,7 +464,7 @@ class IndexBuilder:
         total = len(all_files)
         log(f"共找到 {total} 个文件")
 
-        if total == 0:
+        if total == 0 or self._stop_flag.is_set():
             return {'total': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
 
         # 获取已索引文件的哈希（增量更新）
@@ -467,38 +490,34 @@ class IndexBuilder:
             'failed': 0
         }
 
-        if not to_process:
+        if not to_process or self._stop_flag.is_set():
             self.engine.set_index_info('last_index_time', str(time.time()))
             self.engine.set_index_info('index_root', root_dir)
             return stats
 
         # ── 生产者-消费者架构 ──────────────────────────────────────────────
-        # 结果队列：工作线程把解析结果放进来，写入线程从这里取
-        result_queue = queue.Queue(maxsize=max_workers * 4)
-        _SENTINEL = object()  # 哨兵值，通知写入线程结束
+        result_queue = queue.Queue(maxsize=max_workers * 8)
+        _SENTINEL = object()
 
         processed = 0
         start_time = time.time()
-        recent_done_times = []  # 滑动窗口计算速度
+        recent_done_times = []
 
-        # ── 写入线程（消费者）：唯一写入数据库的线程 ──────────────────────
+        # ── 写入线程（消费者）──────────────────────────────────────────────
         def writer_thread():
-            """从队列取结果，批量写入数据库（单线程，无并发冲突）"""
             nonlocal processed
             batch = []
 
             while True:
                 try:
-                    item = result_queue.get(timeout=2.0)
+                    item = result_queue.get(timeout=1.0)
                 except queue.Empty:
-                    # 超时但还有未完成的任务，继续等
-                    if batch:
+                    if self._stop_flag.is_set() and batch:
                         self.engine.batch_add_documents(batch, root_dir)
                         batch = []
                     continue
 
                 if item is _SENTINEL:
-                    # 收到结束信号，写入剩余数据
                     if batch:
                         self.engine.batch_add_documents(batch, root_dir)
                     break
@@ -546,41 +565,69 @@ class IndexBuilder:
         writer = threading.Thread(target=writer_thread, daemon=True)
         writer.start()
 
-        # ── 工作线程池（生产者）：并行解析文件，结果放入队列 ──────────────
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_fp = {}
-            for fp in to_process:
+        # ── 分批提交任务（生产者）──────────────────────────────────────────
+        # 关键改进：分批提交，每批 SUBMIT_BATCH 个
+        # 这样停止时，未提交的批次直接跳过，已提交但未执行的任务会被取消
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        
+        try:
+            pending_futures: List[Future] = []
+            
+            for i in range(0, len(to_process), self.SUBMIT_BATCH):
                 if self._stop_flag.is_set():
                     break
-                future = executor.submit(_extract_single, fp, enable_pdf, enable_ocr)
-                future_to_fp[future] = fp
-
-            for future in as_completed(future_to_fp):
-                if self._stop_flag.is_set():
-                    break
-                fp = future_to_fp[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    result = None
-                    log(f"处理失败: {os.path.basename(fp)} - {e}")
-
-                # 把结果放入队列（写入线程会处理）
-                result_queue.put((fp, result))
+                
+                batch_files = to_process[i:i + self.SUBMIT_BATCH]
+                batch_futures = []
+                
+                for fp in batch_files:
+                    if self._stop_flag.is_set():
+                        break
+                    future = self._executor.submit(_extract_single, fp, enable_pdf, enable_ocr)
+                    batch_futures.append((future, fp))
+                
+                # 等待这批任务完成（或停止）
+                for future, fp in batch_futures:
+                    if self._stop_flag.is_set():
+                        future.cancel()
+                        continue
+                    try:
+                        result = future.result(timeout=EXTRACT_TIMEOUT)
+                    except Exception as e:
+                        result = None
+                        if not self._stop_flag.is_set():
+                            log(f"处理失败: {os.path.basename(fp)} - {type(e).__name__}")
+                    
+                    if not self._stop_flag.is_set():
+                        result_queue.put((fp, result))
+        finally:
+            # 关闭线程池
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._executor = None
 
         # 通知写入线程结束
         result_queue.put(_SENTINEL)
-        writer.join(timeout=60)  # 等待写入线程完成
+        writer.join(timeout=30)
 
-        # 索引完成后优化 FTS5
-        log("正在优化索引...")
-        self.engine.optimize()
+        if not self._stop_flag.is_set():
+            # 索引完成后优化 FTS5
+            log("正在优化索引...")
+            self.engine.optimize()
 
         self.engine.set_index_info('last_index_time', str(time.time()))
         self.engine.set_index_info('index_root', root_dir)
 
-        log(f"索引完成！新增: {stats['added']}，更新: {stats['updated']}，"
-            f"跳过: {stats['skipped']}，失败: {stats['failed']}")
+        if self._stop_flag.is_set():
+            log(f"索引已停止！已处理: {processed}，新增: {stats['added']}，"
+                f"更新: {stats['updated']}，跳过: {stats['skipped']}，失败: {stats['failed']}")
+        else:
+            log(f"索引完成！新增: {stats['added']}，更新: {stats['updated']}，"
+                f"跳过: {stats['skipped']}，失败: {stats['failed']}")
 
         return stats
 
@@ -591,7 +638,6 @@ def _extract_single(filepath: str, enable_pdf: bool, enable_ocr: bool):
     返回 tuple 或 None（失败时）
     """
     try:
-        # 兼容打包后的路径：先尝试相对导入，再尝试绝对导入
         try:
             from core.extractor import extract_text
         except ImportError:

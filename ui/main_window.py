@@ -38,7 +38,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -104,9 +104,22 @@ QPushButton#btn_secondary:hover {
 }
 QPushButton#btn_danger {
     background-color: #D32F2F;
+    color: white;
+    font-weight: bold;
+    font-size: 13px;
+    border: 2px solid #B71C1C;
+    padding: 6px 14px;
+    min-width: 80px;
+    min-height: 30px;
 }
 QPushButton#btn_danger:hover {
     background-color: #B71C1C;
+    border: 2px solid #7F0000;
+}
+QPushButton#btn_danger:disabled {
+    background-color: #EF9A9A;
+    color: #FFFFFF;
+    border: 2px solid #E57373;
 }
 QPushButton#btn_success {
     background-color: #388E3C;
@@ -788,30 +801,14 @@ class MainWindow(QMainWindow):
         logo_label.setFixedSize(36, 36)
         title_row.addWidget(logo_label)
 
-        # 标题文字：优先加载打包的 title_text.png，失败则回退到 QPainter
-        title_label = QLabel()
+        # 标题文字：直接用 QLabel 显示文字，不依赖图片文件
+        # 这是最可靠的方式，Qt 会自动使用系统字体
+        title_label = QLabel(APP_NAME)
         title_label.setObjectName("label_title")
-        
-        title_img_path = os.path.join(assets_dir, 'title_text.png')
-        if os.path.isfile(title_img_path):
-            _title_pix = QPixmap(title_img_path)
-            title_label.setPixmap(_title_pix)
-            title_label.setFixedSize(_title_pix.width(), _title_pix.height())
-        else:
-            # 回退方案：用 QPainter 在内存中绘制
-            from PyQt5.QtGui import QPainter, QColor, QFont as _QFont
-            _title_w, _title_h = 240, 36
-            _title_pix = QPixmap(_title_w, _title_h)
-            _title_pix.fill(Qt.transparent)
-            _tp = QPainter(_title_pix)
-            _tp.setRenderHint(QPainter.TextAntialiasing)
-            _f = _QFont('Microsoft YaHei', 18, _QFont.Bold)
-            _tp.setFont(_f)
-            _tp.setPen(QColor('#1565C0'))
-            _tp.drawText(0, 0, _title_w, _title_h, Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
-            _tp.end()
-            title_label.setPixmap(_title_pix)
-            title_label.setFixedSize(_title_w, _title_h)
+        title_label.setStyleSheet(
+            "color: #1565C0; font-size: 20px; font-weight: bold;"
+            "font-family: '微软雅黑', 'Microsoft YaHei', 'SimHei', '黑体', sans-serif;"
+        )
         title_row.addWidget(title_label)
         title_row.addStretch()
 
@@ -969,10 +966,10 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.progress_title)
         header_row.addStretch()
 
-        self.stop_btn = QPushButton("停止索引")
+        self.stop_btn = QPushButton("⏹ 停止索引")
         self.stop_btn.setObjectName("btn_danger")
-        self.stop_btn.setMaximumWidth(90)
-        self.stop_btn.setMaximumHeight(28)
+        self.stop_btn.setMinimumWidth(100)
+        self.stop_btn.setMinimumHeight(32)
         self.stop_btn.clicked.connect(self._stop_indexing)
         header_row.addWidget(self.stop_btn)
         layout.addLayout(header_row)
@@ -1264,11 +1261,16 @@ class MainWindow(QMainWindow):
         self._update_status("索引中...")
 
     def _stop_indexing(self):
-        """停止索引"""
+        """停止索引（立即生效）"""
         if self.index_worker and self.index_worker.isRunning():
-            self.index_worker.stop()
-            self.progress_title.setText("正在停止...")
+            self.progress_title.setText("正在停止，请稍候...")
             self.stop_btn.setEnabled(False)
+            self.stop_btn.setText("停止中...")
+            # 调用 IndexWorker.stop()，内部会调用 IndexBuilder.stop()
+            # IndexBuilder.stop() 会设置 _stop_flag 并关闭线程池
+            self.index_worker.stop()
+            # 给 UI 一个反馈，让用户知道已经发出停止信号
+            self._update_status("停止信号已发出，正在等待当前文件处理完成...")
 
     def _on_index_progress(self, current: int, total: int, filepath: str):
         """索引进度更新"""
