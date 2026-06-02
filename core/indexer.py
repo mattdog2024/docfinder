@@ -591,7 +591,15 @@ def _extract_single(filepath: str, enable_pdf: bool, enable_ocr: bool):
     返回 tuple 或 None（失败时）
     """
     try:
-        from core.extractor import extract_text
+        # 兼容打包后的路径：先尝试相对导入，再尝试绝对导入
+        try:
+            from core.extractor import extract_text
+        except ImportError:
+            import sys, os as _os
+            _base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            if _base not in sys.path:
+                sys.path.insert(0, _base)
+            from core.extractor import extract_text
         filename = os.path.basename(filepath)
         ext = os.path.splitext(filename)[1].lower()
         stat = os.stat(filepath)

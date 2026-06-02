@@ -37,7 +37,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -748,36 +748,75 @@ class MainWindow(QMainWindow):
         title_row.setSpacing(8)
 
         # Logo 图标
+        # 标题图标：用 QPainter 在内存中直接绘制，不依赖外部文件
         logo_label = QLabel()
-        assets_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets')
-        logo_path = os.path.join(assets_dir, 'logo_icon.png')
-        if os.path.exists(logo_path):
+        # 先尝试加载外部图标文件
+        _assets_candidates = []
+        if getattr(sys, 'frozen', False):
+            _assets_candidates.append(os.path.join(sys._MEIPASS, 'assets'))
+            _assets_candidates.append(os.path.join(os.path.dirname(sys.executable), 'assets'))
+        _assets_candidates.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets'))
+        assets_dir = ''
+        for _d in _assets_candidates:
+            if os.path.isdir(_d):
+                assets_dir = _d
+                break
+        logo_path = os.path.join(assets_dir, 'logo_icon.png') if assets_dir else ''
+        _logo_loaded = False
+        if logo_path and os.path.exists(logo_path):
             pix = QPixmap(logo_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_label.setPixmap(pix)
-        else:
-            logo_label.setText("D")
+            if not pix.isNull():
+                logo_label.setPixmap(pix)
+                _logo_loaded = True
+        if not _logo_loaded:
+            # 用 QPainter 绘制一个简单的搜索图标
+            from PyQt5.QtGui import QPainter, QColor, QPen, QBrush
+            _icon_pix = QPixmap(32, 32)
+            _icon_pix.fill(Qt.transparent)
+            _p = QPainter(_icon_pix)
+            _p.setRenderHint(QPainter.Antialiasing)
+            _p.setBrush(QBrush(QColor('#1565C0')))
+            _p.setPen(Qt.NoPen)
+            _p.drawRoundedRect(0, 0, 32, 32, 6, 6)
+            _p.setPen(QPen(QColor('white'), 2))
+            _p.drawLine(8, 10, 24, 10)
+            _p.drawLine(8, 16, 20, 16)
+            _p.drawLine(8, 22, 22, 22)
+            _p.end()
+            logo_label.setPixmap(_icon_pix)
         logo_label.setFixedSize(36, 36)
         title_row.addWidget(logo_label)
 
-        # 标题文字：优先用图片（彻底避免字体乱码），回退到 QFont 方式
+        # 标题文字：用 QPainter 在内存中直接绘制，彻底不依赖外部文件和字体
         title_label = QLabel()
         title_label.setObjectName("label_title")
-        title_img_path = os.path.join(assets_dir, 'title_text.png')
-        if os.path.exists(title_img_path):
-            # 用图片显示标题，完全不依赖字体，100% 不会乱码
-            title_pix = QPixmap(title_img_path)
-            title_label.setPixmap(title_pix)
-            title_label.setFixedHeight(36)
-        else:
-            # 回退方案：直接用 QFont 设置（不用样式表，避免覆盖）
-            from PyQt5.QtGui import QFont as _QFont
-            f = _QFont()
-            f.setFamily('Microsoft YaHei')
-            f.setPointSize(16)
-            f.setBold(True)
-            title_label.setFont(f)
-            title_label.setText(APP_NAME)
-            title_label.setStyleSheet('color: #1565C0;')
+        # 用 QPainter 在内存中绘制标题图片（完全不依赖字体）
+        from PyQt5.QtGui import QPainter, QColor, QFont as _QFont
+        _title_w, _title_h = 240, 36
+        _title_pix = QPixmap(_title_w, _title_h)
+        _title_pix.fill(Qt.transparent)
+        _tp = QPainter(_title_pix)
+        _tp.setRenderHint(QPainter.TextAntialiasing)
+        # 依次尝试各种中文字体
+        _font_ok = False
+        for _fname in ['Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', 'SimSun', '宋体', 'Arial']:
+            _f = _QFont(_fname, 18, _QFont.Bold)
+            _tp.setFont(_f)
+            _fm = _tp.fontMetrics()
+            # 测试这个字体能否正确显示中文（宽度应该大于 50px）
+            if _fm.width('文档搜索') > 50:
+                _font_ok = True
+                break
+        if not _font_ok:
+            _f = _QFont()
+            _f.setPointSize(18)
+            _f.setBold(True)
+            _tp.setFont(_f)
+        _tp.setPen(QColor('#1565C0'))
+        _tp.drawText(0, 0, _title_w, _title_h, Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
+        _tp.end()
+        title_label.setPixmap(_title_pix)
+        title_label.setFixedSize(_title_w, _title_h)
         title_row.addWidget(title_label)
         title_row.addStretch()
 
@@ -1177,9 +1216,20 @@ class MainWindow(QMainWindow):
     def _start_indexing(self, settings: Dict):
         """开始索引任务"""
         db_path = settings['db_path']
+        if not db_path:
+            QMessageBox.warning(self, "错误", "索引文件路径不能为空")
+            return
 
-        # 确保目录存在
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        # 确保目录存在（处理只有文件名没有目录的情况）
+        db_path = os.path.abspath(db_path)
+        settings['db_path'] = db_path
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"无法创建目录：{db_dir}\n{e}")
+                return
 
         # 初始化引擎
         self.engine = IndexEngine(db_path)

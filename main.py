@@ -19,7 +19,15 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
 
 # 添加项目根目录到路径（便携版兼容）
-_base_dir = os.path.dirname(os.path.abspath(__file__))
+# 打包后 __file__ 在 _internal 目录里，需要特殊处理
+if getattr(sys, 'frozen', False):
+    # 打包后的 exe 运行环境
+    _base_dir = sys._MEIPASS  # PyInstaller 解压目录
+    _exe_dir = os.path.dirname(sys.executable)  # exe 所在目录
+else:
+    _base_dir = os.path.dirname(os.path.abspath(__file__))
+    _exe_dir = _base_dir
+
 if _base_dir not in sys.path:
     sys.path.insert(0, _base_dir)
 
@@ -55,16 +63,22 @@ def main():
     # 应用样式表
     app.setStyleSheet(STYLE_SHEET)
 
-    # 设置应用图标
-    icon_path = os.path.join(_base_dir, 'assets', 'logo_icon.ico')
-    if not os.path.exists(icon_path):
-        icon_path = os.path.join(_base_dir, 'assets', 'logo_icon.png')
-    if os.path.exists(icon_path):
+    # 设置应用图标（先找 _MEIPASS 里的 assets，再找 exe 旁边的 assets）
+    icon_path = ''
+    for search_dir in [_base_dir, _exe_dir]:
+        for icon_name in ['logo_icon.ico', 'logo_icon.png']:
+            candidate = os.path.join(search_dir, 'assets', icon_name)
+            if os.path.exists(candidate):
+                icon_path = candidate
+                break
+        if icon_path:
+            break
+    if icon_path:
         app_icon = QIcon(icon_path)
         app.setWindowIcon(app_icon)
 
     window = MainWindow()
-    if os.path.exists(icon_path):
+    if icon_path:
         window.setWindowIcon(QIcon(icon_path))
     window.show()
 
