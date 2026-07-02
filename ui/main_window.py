@@ -38,7 +38,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 

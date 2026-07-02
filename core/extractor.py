@@ -102,8 +102,10 @@ def extract_doc(filepath: str) -> str:
     提取 .doc 文件文本（Word 97-2003 OLE 格式）
 
     策略：
-    1. win32com（Windows + Word 已安装）：3秒超时，快速失败
-    2. olefile 扫描 Unicode 字符：纯 Python 兜底
+    1. win32com（Windows + Word 已安装）：10秒超时，最可靠
+    2. 纯 Python OLE 解析：扫描 WordDocument 流中的 UTF-16LE 文本
+       - 按段落分隔符(0x000D/0x0007)切分段落
+       - 过滤乱码：要求 >=80% 常用字符，>=2个常用汉字或3个连续字母
     3. 都失败则返回空字符串（文件名仍会被索引）
     """
     if not _check_file(filepath):
@@ -116,7 +118,6 @@ def extract_doc(filepath: str) -> str:
             import threading
 
             result_holder = [None]
-            error_holder = [None]
 
             def _do_extract():
                 word = None
@@ -132,8 +133,8 @@ def extract_doc(filepath: str) -> str:
                     text = doc.Content.Text
                     doc.Close(False)
                     result_holder[0] = text
-                except Exception as e:
-                    error_holder[0] = e
+                except Exception:
+                    pass
                 finally:
                     if word:
                         try:
@@ -143,14 +144,14 @@ def extract_doc(filepath: str) -> str:
 
             t = threading.Thread(target=_do_extract, daemon=True)
             t.start()
-            t.join(timeout=10)  # 最多等 10 秒
+            t.join(timeout=10)
 
             if result_holder[0] and len(result_holder[0].strip()) > 10:
                 return result_holder[0][:MAX_CONTENT_CHARS]
         except Exception:
             pass
 
-    # 方式2：olefile 扫描 Unicode 中文字符（纯 Python 兜底）
+    # 方式2：纯 Python OLE 解析（不依赖任何外部软件，在任何电脑上都能工作）
     try:
         import olefile
         import struct
@@ -159,59 +160,84 @@ def extract_doc(filepath: str) -> str:
             return ''
 
         ole = olefile.OleFileIO(filepath)
-
-        if not ole.exists('WordDocument'):
+        try:
+            if not ole.exists('WordDocument'):
+                return ''
+            wd_data = ole.openstream('WordDocument').read()
+        finally:
             ole.close()
-            return ''
 
-        wd_data = ole.openstream('WordDocument').read()
-
-        # 判断使用哪个 Table 流
-        flags = struct.unpack_from('<H', wd_data, 10)[0]
-        use_1table = bool(flags & 0x0200)
-        table_name = '1Table' if use_1table else '0Table'
-
-        table_data = b''
-        if ole.exists(table_name):
-            table_data = ole.openstream(table_name).read()
-
-        ole.close()
-
-        # 扫描 UTF-16LE 中文字符
-        texts = []
+        # 扫描 WordDocument 流中的 UTF-16LE 文本
+        # Word 97 的文本以 UTF-16LE 存储，段落以 0x000D 或 0x0007 分隔
+        paragraphs = []
         current = []
+        i = 0
 
-        for data in [wd_data, table_data]:
-            i = 0
-            while i < len(data) - 1:
-                c = struct.unpack_from('<H', data, i)[0]
-                if (0x4E00 <= c <= 0x9FFF or   # CJK 统一汉字
-                    0x3400 <= c <= 0x4DBF or   # CJK 扩展A
-                    0x0020 <= c <= 0x007E or   # ASCII 可打印字符
-                    0x3000 <= c <= 0x303F or   # CJK 标点
-                    0xFF00 <= c <= 0xFFEF or   # 全角字符
-                    0x2000 <= c <= 0x206F):    # 通用标点
-                    current.append(chr(c))
-                else:
-                    if len(current) >= 5:
-                        texts.append(''.join(current))
+        while i < len(wd_data) - 1:
+            try:
+                c = struct.unpack_from('<H', wd_data, i)[0]
+            except struct.error:
+                break
+
+            if c == 0x000D or c == 0x0007:
+                # 段落分隔符
+                if current:
+                    text = ''.join(current).strip()
+                    if text:
+                        paragraphs.append(text)
                     current = []
-                i += 2
-            if len(current) >= 5:
-                texts.append(''.join(current))
-            current = []
+            elif (0x4E00 <= c <= 0x9FFF or   # CJK 统一汉字（常用区）
+                  0x0020 <= c <= 0x007E or   # ASCII 可打印字符
+                  0x3000 <= c <= 0x303F or   # CJK 标点
+                  0xFF00 <= c <= 0xFFEF or   # 全角字符
+                  0x2014 <= c <= 0x2015 or   # 破折号
+                  0x201C <= c <= 0x201D or   # 引号
+                  0x2018 <= c <= 0x2019):    # 单引号
+                current.append(chr(c))
+            else:
+                # 遇到不可识别字符，结束当前块
+                if len(current) >= 2:
+                    text = ''.join(current).strip()
+                    if text:
+                        paragraphs.append(text)
+                current = []
+            i += 2
 
-        # 去重并合并
+        if current:
+            text = ''.join(current).strip()
+            if text:
+                paragraphs.append(text)
+
+        # 过滤乱码段落
+        def _is_meaningful(text: str) -> bool:
+            total = len(text)
+            if total < 5:
+                return False
+            # 统计常用汉字（4E00-9FFF，不含扩展区）
+            chinese_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+            # 统计 ASCII 字母
+            alpha_count = sum(1 for c in text if c.isalpha() and ord(c) < 128)
+            # 必须包含至少 2 个常用汉字 或 3 个连续字母
+            has_chinese = chinese_count >= 2
+            has_english = bool(re.search(r'[a-zA-Z]{3,}', text))
+            if not (has_chinese or has_english):
+                return False
+            # 常用汉字 + ASCII 字母占比必须 >= 50%
+            if (chinese_count + alpha_count) / total < 0.5:
+                return False
+            return True
+
+        # 去重并过滤
         seen = set()
-        unique_texts = []
-        for t in texts:
-            t_clean = t.strip()
-            if t_clean and t_clean not in seen and len(t_clean) >= 3:
-                seen.add(t_clean)
-                unique_texts.append(t_clean)
+        result_lines = []
+        for p in paragraphs:
+            p = p.strip()
+            if p and p not in seen and _is_meaningful(p):
+                seen.add(p)
+                result_lines.append(p)
 
-        result = ' '.join(unique_texts)
-        if len(result.strip()) > 10:
+        result = '\n'.join(result_lines)
+        if len(result.strip()) > 5:
             return result[:MAX_CONTENT_CHARS]
     except Exception:
         pass
