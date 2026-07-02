@@ -38,7 +38,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -1608,28 +1608,57 @@ class MainWindow(QMainWindow):
             self._show_offline_preview(result)
 
     def _open_file(self, filepath: str):
-        """用系统默认程序打开文件"""
+        """用系统默认程序打开文件（支持中文路径和所有格式）"""
+        from pathlib import Path
+        p = Path(filepath)
+        if not p.exists():
+            QMessageBox.warning(self, "文件不存在",
+                f"文件已被移动或删除：\n{filepath}\n\n"
+                "您可以点击\"离线预览\"查看已缓存的内容。")
+            return
         try:
             if sys.platform == 'win32':
-                os.startfile(filepath)
+                # 用 ShellExecute 打开，支持中文路径和所有格式
+                # os.startfile 对某些路径可能失败，ShellExecute 更可靠
+                try:
+                    import ctypes
+                    ctypes.windll.shell32.ShellExecuteW(
+                        None, 'open', str(p.resolve()), None, None, 1
+                    )
+                except Exception:
+                    # 降级到 os.startfile
+                    os.startfile(str(p.resolve()))
             elif sys.platform == 'darwin':
-                subprocess.run(['open', filepath])
+                subprocess.Popen(['open', str(p)])
             else:
-                subprocess.run(['xdg-open', filepath])
+                subprocess.Popen(['xdg-open', str(p)])
         except Exception as e:
-            QMessageBox.warning(self, "打开失败", f"无法打开文件：\n{e}")
+            QMessageBox.warning(self, "打开失败",
+                f"无法打开文件：\n{filepath}\n\n错误：{e}\n\n"
+                "请尝试手动打开该文件。")
 
     def _open_folder(self, folder: str):
-        """打开文件夹"""
+        """打开文件夹（支持中文路径）"""
+        from pathlib import Path
+        p = Path(folder)
+        if not p.exists():
+            QMessageBox.warning(self, "文件夹不存在", f"文件夹不存在：\n{folder}")
+            return
         try:
             if sys.platform == 'win32':
-                os.startfile(folder)
+                try:
+                    import ctypes
+                    ctypes.windll.shell32.ShellExecuteW(
+                        None, 'explore', str(p.resolve()), None, None, 1
+                    )
+                except Exception:
+                    subprocess.Popen(['explorer', str(p.resolve())])
             elif sys.platform == 'darwin':
-                subprocess.run(['open', folder])
+                subprocess.Popen(['open', str(p)])
             else:
-                subprocess.run(['xdg-open', folder])
+                subprocess.Popen(['xdg-open', str(p)])
         except Exception as e:
-            QMessageBox.warning(self, "打开失败", f"无法打开文件夹：\n{e}")
+            QMessageBox.warning(self, "打开失败", f"无法打开文件夹：\n{folder}\n\n错误：{e}")
 
     def _show_offline_preview(self, result: Dict):
         """显示离线预览对话框"""

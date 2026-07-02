@@ -32,6 +32,28 @@ MAX_SNIPPETS = 5
 EXTRACT_TIMEOUT = 30
 
 
+def _tokenize_for_fts(text: str) -> str:
+    """
+    对文本进行分词处理，使 FTS5 能正确搜索中文。
+
+    原理：FTS5 的 unicode61 分词器对中文不按字切分，
+    把连续中文当作一个 token，导致搜索"监狱"无法匹配"女子监狱"。
+    解决方案：在每个中文字符之间插入空格，让 FTS5 按字索引。
+    """
+    if not text:
+        return ''
+    import re
+    # 在中文字符之间插入空格（保留英文单词和数字不变）
+    # 匹配连续的中文字符块，在每个字之间加空格
+    result = re.sub(
+        r'([\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef])',
+        r' \1 ',
+        text
+    )
+    # 清理多余空格
+    return ' '.join(result.split())
+
+
 def get_file_hash(filepath: str) -> str:
     """用文件大小 + 修改时间作为快速指纹（比 MD5 快 100 倍）"""
     try:
@@ -153,6 +175,9 @@ class IndexEngine:
             cursor.execute("SELECT id FROM documents WHERE filepath=?", (filepath,))
             row = cursor.fetchone()
 
+            # 对内容和文件名进行中文分词，确保 FTS5 能按字搜索
+            tokens = _tokenize_for_fts((content or '') + ' ' + filename)
+
             if row:
                 doc_id = row[0]
                 cursor.execute('''
@@ -164,7 +189,7 @@ class IndexEngine:
                 cursor.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
                 cursor.execute(
                     "INSERT INTO documents_fts(rowid, filepath, filename, content_tokens) VALUES(?,?,?,?)",
-                    (doc_id, filepath, filename, content or '')
+                    (doc_id, filepath, filename, tokens)
                 )
             else:
                 cursor.execute('''
@@ -176,7 +201,7 @@ class IndexEngine:
                 doc_id = cursor.lastrowid
                 cursor.execute(
                     "INSERT INTO documents_fts(rowid, filepath, filename, content_tokens) VALUES(?,?,?,?)",
-                    (doc_id, filepath, filename, content or '')
+                    (doc_id, filepath, filename, tokens)
                 )
 
         conn.commit()
@@ -263,7 +288,12 @@ class IndexEngine:
         for row in results:
             doc_id, filepath, filename, extension, filesize, modified_time, content, index_root = row
             snippets = self._extract_snippets(content, query)
-            file_exists = os.path.exists(filepath)
+            # 用 pathlib.Path 处理中文路径（os.path.exists 在 Windows 中文路径下有时失效）
+            try:
+                from pathlib import Path
+                file_exists = Path(filepath).exists()
+            except Exception:
+                file_exists = os.path.exists(filepath)
             output.append({
                 'id': doc_id,
                 'filepath': filepath,

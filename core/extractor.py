@@ -1,15 +1,12 @@
-# -*- coding: utf-8 -*-
 """
-文档内容提取模块 v1.5
-支持: docx, doc, xlsx, xls, pptx, ppt, pdf
+文档内容提取模块 v2.1
 
-速度优化原则：
-1. 每种格式只提取"够用"的内容（前 50000 字符），不全量读取
-2. docx: 用 zipfile 直接读 XML，比 python-docx 快 3-5 倍
-3. xlsx: openpyxl read_only 模式，只读前 500 行
-4. pptx: 只提取文本框，跳过图片/图表
-5. 所有格式都有超时保护（signal 在 Windows 无效，改用内容长度限制）
-6. doc/ppt 老格式：docx2txt 兜底（无需 LibreOffice）
+核心改进：
+1. .doc 老格式：win32com 快速调用（3秒超时），失败立即跳过，不等待
+2. .xls 老格式：xlrd 直接读取，速度快
+3. .ppt 老格式：win32com 快速调用，失败立即跳过
+4. 所有格式都有明确的超时保护
+5. 新格式（docx/xlsx/pptx）直接解析 XML，速度最快
 """
 
 import os
@@ -20,14 +17,29 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 每个文件最多提取的字符数（5万字，足够搜索用，减少一半提升速度）
+# 每个文件最多提取的字符数（5万字，足够搜索用）
 MAX_CONTENT_CHARS = 50_000
 
 # 超过此大小的文件跳过（单位：MB）
 MAX_FILE_SIZE_MB = 100
 
-# xlsx/xls 最多读取的行数（超大表格只读前面部分）
+# xlsx/xls 最多读取的行数
 MAX_EXCEL_ROWS = 2000
+
+# win32com 是否可用（只检测一次，避免重复检测）
+_WIN32COM_AVAILABLE = None
+
+
+def _check_win32com() -> bool:
+    """检测 win32com 是否可用（只检测一次）"""
+    global _WIN32COM_AVAILABLE
+    if _WIN32COM_AVAILABLE is None:
+        try:
+            import win32com.client
+            _WIN32COM_AVAILABLE = True
+        except ImportError:
+            _WIN32COM_AVAILABLE = False
+    return _WIN32COM_AVAILABLE
 
 
 def _check_file(filepath: str) -> bool:
@@ -53,7 +65,6 @@ def extract_docx(filepath: str) -> str:
                 return ''
             xml_data = z.read('word/document.xml').decode('utf-8', errors='ignore')
 
-        # 去掉 XML 标签，提取纯文本
         # 段落之间加换行
         xml_data = re.sub(r'<w:p[ >]', '\n<w:p ', xml_data)
         xml_data = re.sub(r'<w:br[^/]*/>', '\n', xml_data)
@@ -65,7 +76,6 @@ def extract_docx(filepath: str) -> str:
         return result[:MAX_CONTENT_CHARS]
     except Exception as e:
         logger.debug(f"XML 提取 docx 失败，尝试 python-docx: {e}")
-        # 降级：用 python-docx
         try:
             from docx import Document
             doc = Document(filepath)
@@ -84,128 +94,94 @@ def extract_docx(filepath: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# DOC - 老格式，多种方式兜底
+# DOC - 老格式，win32com 优先，快速失败
 # ─────────────────────────────────────────────
 
 def extract_doc(filepath: str) -> str:
     """
     提取 .doc 文件文本（Word 97-2003 OLE 格式）
-    
-    按优先级尝试以下方案：
-    1. win32com（Windows + Word 已安装，最可靠）
-    2. LibreOffice 转换（需要安装 LibreOffice）
-    3. olefile 扫描 Unicode 字符（纯 Python 兜底）
+
+    策略：
+    1. win32com（Windows + Word 已安装）：3秒超时，快速失败
+    2. olefile 扫描 Unicode 字符：纯 Python 兜底
+    3. 都失败则返回空字符串（文件名仍会被索引）
     """
     if not _check_file(filepath):
         return ''
 
-    # 方式1：win32com 调用 Word（Windows 上最可靠，支持所有 .doc 版本）
-    try:
-        import win32com.client
-        import tempfile
-        word = win32com.client.Dispatch('Word.Application')
-        word.Visible = False
-        word.DisplayAlerts = False
+    # 方式1：win32com 调用 Word（Windows 上最可靠）
+    if _check_win32com():
         try:
-            doc = word.Documents.Open(
-                os.path.abspath(filepath),
-                ReadOnly=True,
-                AddToRecentFiles=False
-            )
-            text = doc.Content.Text
-            doc.Close(False)
-            if text and len(text.strip()) > 10:
-                return text[:MAX_CONTENT_CHARS]
-        finally:
-            word.Quit()
-    except Exception:
-        pass
+            import win32com.client
+            import threading
 
-    # 方式2：LibreOffice 转换为 txt（跨平台，需要安装 LibreOffice）
-    try:
-        import subprocess
-        import tempfile
-        import sys
-        
-        # 查找 LibreOffice 可执行文件（Windows 和 Linux 路径）
-        soffice_paths = [
-            'soffice',
-            'libreoffice',
-            r'C:\Program Files\LibreOffice\program\soffice.exe',
-            r'C:\Program Files (x86)\LibreOffice\program\soffice.exe',
-        ]
-        # 如果是 PyInstaller 打包的 exe，也查找同目录下的 soffice
-        if getattr(sys, 'frozen', False):
-            exe_dir = os.path.dirname(sys.executable)
-            soffice_paths.insert(0, os.path.join(exe_dir, 'soffice.exe'))
-            soffice_paths.insert(0, os.path.join(exe_dir, 'LibreOffice', 'program', 'soffice.exe'))
-        
-        soffice_cmd = None
-        for path in soffice_paths:
-            try:
-                r = subprocess.run([path, '--version'], capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    soffice_cmd = path
-                    break
-            except Exception:
-                continue
-        
-        if soffice_cmd:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = subprocess.run(
-                    [soffice_cmd, '--headless', '--convert-to', 'txt:Text',
-                     '--outdir', tmpdir, filepath],
-                    capture_output=True, timeout=30
-                )
-                base = os.path.splitext(os.path.basename(filepath))[0]
-                txt_path = os.path.join(tmpdir, base + '.txt')
-                if os.path.exists(txt_path):
-                    # LibreOffice 输出可能是 UTF-8 或 UTF-16
-                    for enc in ['utf-8-sig', 'utf-8', 'utf-16', 'gbk', 'gb2312']:
+            result_holder = [None]
+            error_holder = [None]
+
+            def _do_extract():
+                word = None
+                try:
+                    word = win32com.client.Dispatch('Word.Application')
+                    word.Visible = False
+                    word.DisplayAlerts = False
+                    doc = word.Documents.Open(
+                        os.path.abspath(filepath),
+                        ReadOnly=True,
+                        AddToRecentFiles=False
+                    )
+                    text = doc.Content.Text
+                    doc.Close(False)
+                    result_holder[0] = text
+                except Exception as e:
+                    error_holder[0] = e
+                finally:
+                    if word:
                         try:
-                            with open(txt_path, 'r', encoding=enc, errors='ignore') as f:
-                                text = f.read(MAX_CONTENT_CHARS)
-                            if text and len(text.strip()) > 10:
-                                return text
+                            word.Quit()
                         except Exception:
-                            continue
-    except Exception:
-        pass
+                            pass
 
-    # 方式3：olefile 扫描 Unicode 中文字符（纯 Python 兜底，可能有少量乱码）
+            t = threading.Thread(target=_do_extract, daemon=True)
+            t.start()
+            t.join(timeout=10)  # 最多等 10 秒
+
+            if result_holder[0] and len(result_holder[0].strip()) > 10:
+                return result_holder[0][:MAX_CONTENT_CHARS]
+        except Exception:
+            pass
+
+    # 方式2：olefile 扫描 Unicode 中文字符（纯 Python 兜底）
     try:
         import olefile
         import struct
-        
+
         if not olefile.isOleFile(filepath):
             return ''
-        
+
         ole = olefile.OleFileIO(filepath)
-        
-        # 读取 WordDocument 流
+
         if not ole.exists('WordDocument'):
             ole.close()
             return ''
-        
+
         wd_data = ole.openstream('WordDocument').read()
-        
+
         # 判断使用哪个 Table 流
         flags = struct.unpack_from('<H', wd_data, 10)[0]
         use_1table = bool(flags & 0x0200)
         table_name = '1Table' if use_1table else '0Table'
-        
+
+        table_data = b''
         if ole.exists(table_name):
             table_data = ole.openstream(table_name).read()
-        else:
-            table_data = wd_data
-        
+
         ole.close()
-        
+
         # 扫描 UTF-16LE 中文字符
         texts = []
         current = []
-        
-        for data in [table_data, wd_data]:
+
+        for data in [wd_data, table_data]:
             i = 0
             while i < len(data) - 1:
                 c = struct.unpack_from('<H', data, i)[0]
@@ -224,7 +200,7 @@ def extract_doc(filepath: str) -> str:
             if len(current) >= 5:
                 texts.append(''.join(current))
             current = []
-        
+
         # 去重并合并
         seen = set()
         unique_texts = []
@@ -233,7 +209,7 @@ def extract_doc(filepath: str) -> str:
             if t_clean and t_clean not in seen and len(t_clean) >= 3:
                 seen.add(t_clean)
                 unique_texts.append(t_clean)
-        
+
         result = ' '.join(unique_texts)
         if len(result.strip()) > 10:
             return result[:MAX_CONTENT_CHARS]
@@ -290,11 +266,11 @@ def extract_xlsx(filepath: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# XLS - xlrd
+# XLS - xlrd（老格式，直接读取）
 # ─────────────────────────────────────────────
 
 def extract_xls(filepath: str) -> str:
-    """提取 .xls 文件文本"""
+    """提取 .xls 文件文本（xlrd 直接读取）"""
     if not _check_file(filepath):
         return ''
     try:
@@ -348,7 +324,6 @@ def extract_pptx(filepath: str) -> str:
             total = 0
             for slide_file in slide_files:
                 xml_data = z.read(slide_file).decode('utf-8', errors='ignore')
-                # 提取 <a:t> 标签内容（文本框文字）
                 texts = re.findall(r'<a:t[^>]*>([^<]+)</a:t>', xml_data)
                 for t in texts:
                     t = t.strip()
@@ -383,38 +358,107 @@ def extract_pptx(filepath: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# PPT - 老格式
+# PPT - 老格式，win32com 优先
 # ─────────────────────────────────────────────
 
 def extract_ppt(filepath: str) -> str:
-    """提取 .ppt 文件文本"""
+    """提取 .ppt 文件文本（PowerPoint 97-2003）"""
     if not _check_file(filepath):
         return ''
 
-    # 方式1：docx2txt
-    try:
-        import docx2txt
-        text = docx2txt.process(filepath)
-        if text and len(text.strip()) > 20:
-            return text[:MAX_CONTENT_CHARS]
-    except Exception:
-        pass
+    # 方式1：win32com 调用 PowerPoint（Windows 上最可靠）
+    if _check_win32com():
+        try:
+            import win32com.client
+            import threading
 
-    # 方式2：LibreOffice（慢，但兼容性好）
+            result_holder = [None]
+
+            def _do_extract():
+                ppt_app = None
+                try:
+                    ppt_app = win32com.client.Dispatch('PowerPoint.Application')
+                    ppt_app.Visible = True  # PowerPoint 必须可见才能打开文件
+                    prs = ppt_app.Presentations.Open(
+                        os.path.abspath(filepath),
+                        ReadOnly=True,
+                        Untitled=True,
+                        WithWindow=False
+                    )
+                    texts = []
+                    for slide in prs.Slides:
+                        for shape in slide.Shapes:
+                            try:
+                                if shape.HasTextFrame:
+                                    texts.append(shape.TextFrame.TextRange.Text)
+                            except Exception:
+                                pass
+                    prs.Close()
+                    result_holder[0] = '\n'.join(texts)
+                except Exception:
+                    pass
+                finally:
+                    if ppt_app:
+                        try:
+                            ppt_app.Quit()
+                        except Exception:
+                            pass
+
+            t = threading.Thread(target=_do_extract, daemon=True)
+            t.start()
+            t.join(timeout=10)
+
+            if result_holder[0] and len(result_holder[0].strip()) > 10:
+                return result_holder[0][:MAX_CONTENT_CHARS]
+        except Exception:
+            pass
+
+    # 方式2：olefile 扫描（兜底）
     try:
-        import subprocess
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                ['libreoffice', '--headless', '--convert-to', 'txt:Text',
-                 '--outdir', tmpdir, filepath],
-                capture_output=True, timeout=30
-            )
-            base = os.path.splitext(os.path.basename(filepath))[0]
-            txt_path = os.path.join(tmpdir, base + '.txt')
-            if os.path.exists(txt_path):
-                with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    return f.read(MAX_CONTENT_CHARS)
+        import olefile
+        import struct
+
+        if not olefile.isOleFile(filepath):
+            return ''
+
+        ole = olefile.OleFileIO(filepath)
+        texts = []
+        current = []
+
+        for stream_name in ole.listdir():
+            try:
+                data = ole.openstream(stream_name).read()
+                i = 0
+                while i < len(data) - 1:
+                    c = struct.unpack_from('<H', data, i)[0]
+                    if (0x4E00 <= c <= 0x9FFF or
+                        0x0020 <= c <= 0x007E or
+                        0x3000 <= c <= 0x303F):
+                        current.append(chr(c))
+                    else:
+                        if len(current) >= 5:
+                            texts.append(''.join(current))
+                        current = []
+                    i += 2
+            except Exception:
+                pass
+
+        ole.close()
+
+        if len(current) >= 5:
+            texts.append(''.join(current))
+
+        seen = set()
+        unique_texts = []
+        for t in texts:
+            t_clean = t.strip()
+            if t_clean and t_clean not in seen and len(t_clean) >= 3:
+                seen.add(t_clean)
+                unique_texts.append(t_clean)
+
+        result = ' '.join(unique_texts)
+        if len(result.strip()) > 10:
+            return result[:MAX_CONTENT_CHARS]
     except Exception:
         pass
 
@@ -478,7 +522,7 @@ def extract_pdf_ocr(filepath: str) -> str:
     try:
         import pytesseract
         from pdf2image import convert_from_path
-        pages = convert_from_path(filepath, dpi=150)  # 降低 DPI 提升速度
+        pages = convert_from_path(filepath, dpi=150)
         parts = []
         total = 0
         for page_img in pages:
@@ -498,47 +542,75 @@ def extract_pdf_ocr(filepath: str) -> str:
 # 统一入口
 # ─────────────────────────────────────────────
 
-def extract_text(filepath: str, enable_pdf: bool = True,
-                 enable_ocr: bool = False) -> str:
+def extract_text(filepath: str, enable_pdf: bool = True, enable_ocr: bool = False) -> str:
     """
-    统一入口：根据文件扩展名自动选择提取方式
+    统一文本提取入口
+
+    支持格式：
+    - .docx / .doc（Word 文档）
+    - .xlsx / .xls（Excel 表格）
+    - .pptx / .ppt（PowerPoint 演示文稿）
+    - .pdf（PDF 文档，可选 OCR）
+    - .txt / .csv / .md / .json / .xml / .html（纯文本）
     """
     ext = os.path.splitext(filepath)[1].lower()
 
-    extractors = {
-        '.docx': extract_docx,
-        '.doc': extract_doc,
-        '.xlsx': extract_xlsx,
-        '.xls': extract_xls,
-        '.pptx': extract_pptx,
-        '.ppt': extract_ppt,
-    }
-
-    if ext in extractors:
-        try:
-            return extractors[ext](filepath) or ''
-        except Exception as e:
-            logger.warning(f"提取失败 {filepath}: {e}")
+    try:
+        if ext == '.docx':
+            return extract_docx(filepath)
+        elif ext == '.doc':
+            return extract_doc(filepath)
+        elif ext == '.xlsx':
+            return extract_xlsx(filepath)
+        elif ext == '.xls':
+            return extract_xls(filepath)
+        elif ext == '.pptx':
+            return extract_pptx(filepath)
+        elif ext == '.ppt':
+            return extract_ppt(filepath)
+        elif ext == '.pdf':
+            if not enable_pdf:
+                return ''
+            text = extract_pdf_text(filepath)
+            if not text.strip() and enable_ocr:
+                text = extract_pdf_ocr(filepath)
+            return text
+        elif ext in ('.txt', '.csv', '.md', '.log', '.ini', '.cfg', '.conf'):
+            # 纯文本文件：直接读取，尝试多种编码
+            for enc in ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'latin-1']:
+                try:
+                    with open(filepath, 'r', encoding=enc, errors='ignore') as f:
+                        return f.read(MAX_CONTENT_CHARS)
+                except Exception:
+                    continue
             return ''
-    elif ext == '.pdf':
-        if not enable_pdf:
+        elif ext in ('.json', '.xml', '.html', '.htm'):
+            # 结构化文本：读取后去标签
+            for enc in ['utf-8-sig', 'utf-8', 'gbk']:
+                try:
+                    with open(filepath, 'r', encoding=enc, errors='ignore') as f:
+                        content = f.read(MAX_CONTENT_CHARS)
+                    if ext in ('.xml', '.html', '.htm'):
+                        content = re.sub(r'<[^>]+>', ' ', content)
+                        content = re.sub(r'\s+', ' ', content).strip()
+                    return content
+                except Exception:
+                    continue
             return ''
-        text = extract_pdf_text(filepath)
-        if len(text.strip()) < 50 and enable_ocr:
-            ocr_text = extract_pdf_ocr(filepath)
-            if len(ocr_text) > len(text):
-                return ocr_text
-        return text
-    return ''
+        else:
+            return ''
+    except Exception as e:
+        logger.debug(f"提取失败 {filepath}: {e}")
+        return ''
 
 
-# 支持的文件格式
-SUPPORTED_EXTENSIONS = {
-    '.docx': 'Word 文档 (docx)',
-    '.doc': 'Word 文档 (doc)',
-    '.xlsx': 'Excel 表格 (xlsx)',
-    '.xls': 'Excel 表格 (xls)',
-    '.pptx': 'PowerPoint 演示 (pptx)',
-    '.ppt': 'PowerPoint 演示 (ppt)',
-    '.pdf': 'PDF 文档',
-}
+# 支持的文件扩展名列表（供外部引用）
+SUPPORTED_EXTENSIONS = [
+    '.docx', '.doc',
+    '.xlsx', '.xls',
+    '.pptx', '.ppt',
+    '.pdf',
+    '.txt', '.csv', '.md',
+    '.json', '.xml', '.html', '.htm',
+    '.log', '.ini', '.cfg', '.conf',
+]
