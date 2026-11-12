@@ -16,7 +16,8 @@ import threading
 import queue
 import multiprocessing
 from typing import List, Dict, Optional, Callable
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import Future, wait, FIRST_COMPLETED
+from core.extraction_pool import ExtractionPool
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ MAX_SNIPPETS = 5
 # 每个文件提取的最大超时时间（秒）
 EXTRACT_TIMEOUT = 30
 
+LEGACY_PARSER_VERSION = {'.doc': '3', '.ppt': '3'}
 
 def _tokenize_for_fts(text: str) -> str:
     """
@@ -58,7 +60,9 @@ def get_file_hash(filepath: str) -> str:
     """用文件大小 + 修改时间作为快速指纹（比 MD5 快 100 倍）"""
     try:
         stat = os.stat(filepath)
-        return f"{stat.st_size}_{stat.st_mtime}"
+        fingerprint = f"{stat.st_size}_{stat.st_mtime}"
+        version = LEGACY_PARSER_VERSION.get(os.path.splitext(filepath)[1].lower())
+        return fingerprint + (f'_parser{version}' if version else '')
     except Exception:
         return ''
 
@@ -77,7 +81,7 @@ class IndexEngine:
     def _get_conn(self) -> sqlite3.Connection:
         """获取数据库连接（单连接，非线程安全，调用方负责线程安全）"""
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(self.db_path, timeout=1.0, check_same_thread=False)
             self._apply_pragmas(self._conn)
         return self._conn
 
@@ -126,6 +130,29 @@ class IndexEngine:
                 value TEXT
             )
         ''')
+
+        # v1.0/v1.1 的 external-content FTS 指向不存在的 content_tokens 列。
+        # CREATE IF NOT EXISTS 不会迁移旧表；首批更新 DELETE 时会抛错。
+        schema = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE name='documents_fts'"
+        ).fetchone()[0]
+        columns = {r[1] for r in cursor.execute('PRAGMA table_info(documents_fts)')}
+        if 'content=' in schema.replace(' ', '').lower() or 'content_tokens' not in columns:
+            cursor.execute('DROP TABLE documents_fts')
+            cursor.execute('''CREATE VIRTUAL TABLE documents_fts USING fts5(
+                filepath UNINDEXED, filename, content_tokens,
+                tokenize="unicode61 remove_diacritics 1")''')
+            rows = conn.execute('SELECT id, filepath, filename, content FROM documents')
+            while True:
+                chunk = rows.fetchmany(100)
+                if not chunk:
+                    break
+                conn.executemany(
+                    'INSERT INTO documents_fts(rowid,filepath,filename,content_tokens) VALUES(?,?,?,?)',
+                    [(i, fp, name, _tokenize_for_fts((text or '') + ' ' + name))
+                     for i, fp, name, text in chunk]
+                )
+            logger.info('已兼容升级早期 FTS 表，原始文档与离线文本保持不变')
 
         conn.commit()
         conn.close()
@@ -239,7 +266,7 @@ class IndexEngine:
 
         # 方式1：整体作为精确短语搜索
         try:
-            fts_query = self._escape_fts_query(query)
+            fts_query = self._escape_fts_query(_tokenize_for_fts(query))
             cursor.execute('''
                 SELECT d.id, d.filepath, d.filename, d.extension,
                        d.filesize, d.modified_time, d.content, d.index_root
@@ -257,7 +284,7 @@ class IndexEngine:
         if not results and ' ' in query:
             try:
                 words = query.split()
-                fts_parts = [self._escape_fts_query(w) for w in words if w.strip()]
+                fts_parts = [self._escape_fts_query(_tokenize_for_fts(w)) for w in words if w.strip()]
                 fts_query = ' AND '.join(fts_parts)
                 cursor.execute('''
                     SELECT d.id, d.filepath, d.filename, d.extension,
@@ -272,17 +299,27 @@ class IndexEngine:
             except sqlite3.OperationalError:
                 results = []
 
-        # 方式3：LIKE 兜底（确保不漏）
-        if not results:
-            like_query = f'%{query}%'
+        # 老库可能混合旧的中文整段token与新按字token；少量FTS命中不能
+        # 证明旧记录没有命中，中文额外合并原始文本查询结果。
+        if not results or any('\u3400' <= ch <= '\u9fff' for ch in query):
+            words = query.split()
+            clauses = []
+            parameters = []
+            for word in words:
+                escaped = word.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                clauses.append("(content LIKE ? ESCAPE '\\' OR filename LIKE ? ESCAPE '\\')")
+                parameters.extend([f'%{escaped}%', f'%{escaped}%'])
             cursor.execute('''
                 SELECT id, filepath, filename, extension,
                        filesize, modified_time, content, index_root
                 FROM documents
-                WHERE content LIKE ? OR filename LIKE ?
+                WHERE ''' + ' AND '.join(clauses) + '''
                 LIMIT ?
-            ''', (like_query, like_query, limit))
-            results = cursor.fetchall()
+            ''', (*parameters, limit))
+            fallback = cursor.fetchall()
+            found_ids = {row[0] for row in results}
+            results.extend(row for row in fallback if row[0] not in found_ids)
+            results = results[:limit]
 
         output = []
         for row in results:
@@ -405,7 +442,7 @@ class IndexBuilder:
     架构改进：
     - 分批提交任务（每批 SUBMIT_BATCH 个），停止时立即取消未执行的任务
     - 每个文件有超时保护（EXTRACT_TIMEOUT 秒），避免卡在单个文件
-    - 生产者-消费者模式：多线程解析 → 队列 → 单线程写入数据库
+    - 完成顺序取结果，协调线程写库；写库错误向UI传播
     """
 
     SUBMIT_BATCH = 200  # 每批提交的任务数
@@ -413,7 +450,7 @@ class IndexBuilder:
     def __init__(self, engine: IndexEngine):
         self.engine = engine
         self._stop_flag = threading.Event()
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor: Optional[ExtractionPool] = None
 
     def stop(self):
         """立即停止：设置停止标志，并关闭线程池（取消所有待执行任务）"""
@@ -478,9 +515,8 @@ class IndexBuilder:
         3. 生产者-消费者模式，单线程写入数据库
         """
         if max_workers is None:
-            max_workers = min(multiprocessing.cpu_count(), 8)
+            max_workers = min(multiprocessing.cpu_count(), 16)
 
-        self._stop_flag.clear()
 
         def log(msg):
             logger.info(msg)
@@ -495,7 +531,7 @@ class IndexBuilder:
         log(f"共找到 {total} 个文件")
 
         if total == 0 or self._stop_flag.is_set():
-            return {'total': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
+            return {'total': total, 'added': 0, 'updated': 0, 'skipped': 0, 'failed': 0, 'stopped': self._stop_flag.is_set()}
 
         # 获取已索引文件的哈希（增量更新）
         indexed = self.engine.get_indexed_files()
@@ -521,145 +557,131 @@ class IndexBuilder:
         }
 
         if not to_process or self._stop_flag.is_set():
-            self.engine.set_index_info('last_index_time', str(time.time()))
+            stats['stopped'] = self._stop_flag.is_set()
+            if not stats['stopped']:
+                self.engine.set_index_info('last_index_time', str(time.time()))
             self.engine.set_index_info('index_root', root_dir)
             return stats
 
-        # ── 生产者-消费者架构 ──────────────────────────────────────────────
-        result_queue = queue.Queue(maxsize=max_workers * 8)
-        _SENTINEL = object()
-
+        # 协调线程拥有数据库连接，解析线程不写库。
+        # 不再使用无错误传递的后台writer/有界结果队列：写库错误直接上报UI。
+        max_workers = max(1, min(int(max_workers), 16))
+        self._executor = ExtractionPool(max_workers=max_workers)
+        pending = {}
+        expired = set()
+        files = iter(to_process)
+        batch = []
         processed = 0
-        start_time = time.time()
-        recent_done_times = []
+        started = time.monotonic()
+        recent = []
 
-        # ── 写入线程（消费者）──────────────────────────────────────────────
-        def writer_thread():
+        def report(fp):
             nonlocal processed
-            batch = []
+            processed += 1
+            now = time.monotonic()
+            if progress_callback:
+                progress_callback(processed + skipped, total, fp)
+            recent.append(now)
+            if len(recent) > 50:
+                recent.pop(0)
+            if speed_callback and len(recent) > 1:
+                elapsed = recent[-1] - recent[0]
+                if elapsed > 0:
+                    speed = (len(recent) - 1) / elapsed
+                    speed_callback(speed, (len(to_process) - processed) / speed)
 
-            while True:
+        def flush():
+            if batch:
                 try:
-                    item = result_queue.get(timeout=1.0)
-                except queue.Empty:
-                    if self._stop_flag.is_set() and batch:
-                        self.engine.batch_add_documents(batch, root_dir)
-                        batch = []
-                    continue
-
-                if item is _SENTINEL:
-                    if batch:
-                        self.engine.batch_add_documents(batch, root_dir)
-                    break
-
-                fp, result = item
-                is_update = fp in indexed
-
-                if result:
-                    batch.append(result)
-                    if is_update:
-                        stats['updated'] += 1
-                    else:
-                        stats['added'] += 1
-                else:
-                    stats['failed'] += 1
-
-                processed += 1
-
-                # 进度回调
-                if progress_callback:
-                    progress_callback(processed + skipped, total, fp)
-
-                # 速度计算（滑动窗口最近 50 个文件）
-                if speed_callback:
-                    now = time.time()
-                    recent_done_times.append(now)
-                    if len(recent_done_times) > 50:
-                        recent_done_times.pop(0)
-                    if len(recent_done_times) >= 2:
-                        window = recent_done_times[-1] - recent_done_times[0]
-                        if window > 0:
-                            spd = (len(recent_done_times) - 1) / window
-                            remaining = len(to_process) - processed
-                            eta = remaining / spd if spd > 0 else 0
-                            speed_callback(spd, eta)
-
-                # 达到批量大小时写入
-                if len(batch) >= BATCH_SIZE:
                     self.engine.batch_add_documents(batch, root_dir)
-                    batch = []
+                except Exception:
+                    self.engine._get_conn().rollback()
+                    raise
+                for record in batch:
+                    stats['updated' if record[0] in indexed else 'added'] += 1
+                batch.clear()
 
-                result_queue.task_done()
-
-        # 启动写入线程
-        writer = threading.Thread(target=writer_thread, daemon=True)
-        writer.start()
-
-        # ── 分批提交任务（生产者）──────────────────────────────────────────
-        # 关键改进：分批提交，每批 SUBMIT_BATCH 个
-        # 这样停止时，未提交的批次直接跳过，已提交但未执行的任务会被取消
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        
-        try:
-            pending_futures: List[Future] = []
-            
-            for i in range(0, len(to_process), self.SUBMIT_BATCH):
-                if self._stop_flag.is_set():
+        def fill():
+            # 最多2倍工作线程任务，不一次提交几万条；慢文件不挡其他完成结果。
+            while len(pending) < max_workers * 2 and not self._stop_flag.is_set():
+                fp = next(files, None)
+                if fp is None:
                     break
-                
-                batch_files = to_process[i:i + self.SUBMIT_BATCH]
-                batch_futures = []
-                
-                for fp in batch_files:
+                try:
+                    future = self._executor.submit(_extract_single, fp, enable_pdf, enable_ocr)
+                except RuntimeError:
                     if self._stop_flag.is_set():
                         break
-                    future = self._executor.submit(_extract_single, fp, enable_pdf, enable_ocr)
-                    batch_futures.append((future, fp))
-                
-                # 等待这批任务完成（或停止）
-                for future, fp in batch_futures:
-                    if self._stop_flag.is_set():
-                        future.cancel()
+                    raise
+                pending[future] = (fp, time.monotonic())
+
+        error = None
+        try:
+            fill()
+            last_flush = time.monotonic()
+            while pending and not self._stop_flag.is_set():
+                done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    fp, submitted = pending.pop(future)
+                    if future in expired:
+                        expired.remove(future)
                         continue
                     try:
-                        result = future.result(timeout=EXTRACT_TIMEOUT)
-                    except Exception as e:
+                        result = future.result()
+                    except Exception as exc:
                         result = None
-                        if not self._stop_flag.is_set():
-                            log(f"处理失败: {os.path.basename(fp)} - {type(e).__name__}")
-                    
-                    if not self._stop_flag.is_set():
-                        result_queue.put((fp, result))
+                        log(f"解析失败: {os.path.basename(fp)} - {type(exc).__name__}: {exc}")
+                    if result:
+                        batch.append(result)
+                    else:
+                        stats['failed'] += 1
+                    report(fp)
+                    if len(batch) >= BATCH_SIZE:
+                        flush()
+                        last_flush = time.monotonic()
+                now = time.monotonic()
+                for future, (fp, submitted) in list(pending.items()):
+                    if future not in expired and now - submitted >= EXTRACT_TIMEOUT:
+                        # Python线程不能硬杀。保留占用，不无限创建替代线程。
+                        expired.add(future)
+                        future.cancel()
+                        stats['failed'] += 1
+                        report(fp)
+                        log(f"文件解析超时，保留原索引: {fp}")
+                if batch and now - last_flush >= 1.0:
+                    flush()
+                    last_flush = now
+                if pending and all(f in expired for f in pending):
+                    raise RuntimeError(
+                        "多个文件解析长时间没有返回，已暂停索引并保存已完成结果。"
+                        "请关闭重开软件后缩小索引目录；不会删除原文件或旧索引。"
+                    )
+                fill()
+        except Exception as exc:
+            error = exc
         finally:
-            # 关闭线程池
-            try:
-                self._executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                self._executor.shutdown(wait=False)
-            except Exception:
-                pass
+            for future in pending:
+                future.cancel()
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
+            # 写库失败不要重试同一坏批次；解析失败/停止则保存已完成批次。
+            if error is None or isinstance(error, RuntimeError):
+                flush()
 
-        # 通知写入线程结束
-        result_queue.put(_SENTINEL)
-        writer.join(timeout=30)
+        if error is not None:
+            raise error
 
-        if not self._stop_flag.is_set():
-            # 索引完成后优化 FTS5
-            log("正在优化索引...")
-            self.engine.optimize()
-
-        self.engine.set_index_info('last_index_time', str(time.time()))
+        stats['stopped'] = self._stop_flag.is_set()
         self.engine.set_index_info('index_root', root_dir)
-
-        if self._stop_flag.is_set():
-            log(f"索引已停止！已处理: {processed}，新增: {stats['added']}，"
-                f"更新: {stats['updated']}，跳过: {stats['skipped']}，失败: {stats['failed']}")
-        else:
-            log(f"索引完成！新增: {stats['added']}，更新: {stats['updated']}，"
-                f"跳过: {stats['skipped']}，失败: {stats['failed']}")
-
+        self.engine.set_index_info('last_run_stopped', str(int(stats['stopped'])))
+        if not stats['stopped']:
+            self.engine.set_index_info('last_index_time', str(time.time()))
+            log("索引完成，正在合并搜索索引...")
+            self.engine.optimize()
+        log(f"索引{'已停止' if stats['stopped'] else '完成'}：已处理{processed}，"
+            f"新增{stats['added']}，更新{stats['updated']}，跳过{skipped}，失败{stats['failed']}")
         return stats
+
 
 
 def _extract_single(filepath: str, enable_pdf: bool, enable_ocr: bool):
@@ -681,7 +703,8 @@ def _extract_single(filepath: str, enable_pdf: bool, enable_ocr: bool):
         stat = os.stat(filepath)
         filesize = stat.st_size
         mtime = stat.st_mtime
-        fhash = f"{filesize}_{mtime}"
+        version = LEGACY_PARSER_VERSION.get(ext)
+        fhash = f"{filesize}_{mtime}" + (f'_parser{version}' if version else '')
         content = extract_text(
             filepath,
             enable_pdf=(enable_pdf and ext == '.pdf'),

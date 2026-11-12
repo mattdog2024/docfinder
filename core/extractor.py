@@ -2,7 +2,7 @@
 文档内容提取模块 v2.1
 
 核心改进：
-1. .doc 老格式：win32com 快速调用（3秒超时），失败立即跳过，不等待
+1. .doc 老格式：内置 OLE + Word 97+ piece table，不依赖 Word
 2. .xls 老格式：xlrd 直接读取，速度快
 3. .ppt 老格式：win32com 快速调用，失败立即跳过
 4. 所有格式都有明确的超时保护
@@ -13,7 +13,11 @@ import os
 import re
 import logging
 import zipfile
+import struct
 from typing import Optional
+
+# 静态导入：现有 PyInstaller 工作流会自动收集，不需要运行时安装。
+from third_party import olefile
 
 logger = logging.getLogger(__name__)
 
@@ -94,155 +98,135 @@ def extract_docx(filepath: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# DOC - 老格式，win32com 优先，快速失败
+# DOC - Word 97+ FIB/CLX piece table（不依赖 Word）
 # ─────────────────────────────────────────────
 
-def extract_doc(filepath: str) -> str:
-    """
-    提取 .doc 文件文本（Word 97-2003 OLE 格式）
+# MS-DOC 2.9.73: compressed pieces are 8-bit Unicode with these exceptions,
+# not GBK or an encoding inferred from the producer's installation language.
+_DOC_COMPRESSED_MAP = dict(zip(
+    [0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C,
+     0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B,
+     0x9C, 0x9F],
+    [0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030,
+     0x0160, 0x2039, 0x0152, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+     0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0178],
+))
 
-    策略：
-    1. win32com（Windows + Word 已安装）：10秒超时，最可靠
-    2. 纯 Python OLE 解析：扫描 WordDocument 流中的 UTF-16LE 文本
-       - 按段落分隔符(0x000D/0x0007)切分段落
-       - 过滤乱码：要求 >=80% 常用字符，>=2个常用汉字或3个连续字母
-    3. 都失败则返回空字符串（文件名仍会被索引）
+
+def _doc_fib_info(wd_data: bytes):
+    """返回 (table stream, fcClx, lcbClx, ccpText)，损坏/加密时失败。"""
+    def u16(offset):
+        return struct.unpack_from('<H', wd_data, offset)[0]
+
+    def u32(offset):
+        return struct.unpack_from('<I', wd_data, offset)[0]
+
+    if len(wd_data) < 34 or u16(0) != 0xA5EC or u16(2) < 0x00C1:
+        raise ValueError('Not a supported Word 97+ FIB')
+    flags = u16(10)
+    if flags & 0x0100:
+        raise ValueError('Encrypted/obfuscated DOC is not supported')
+    # 跟随 FIB 自身的 csw/cslw 计数，避免把所有版本布局写死。
+    lw_count_offset = 34 + 2 * u16(32)
+    lw_count = u16(lw_count_offset)
+    lw_offset = lw_count_offset + 2
+    if lw_count < 4:
+        raise ValueError('Missing FibRgLw97.ccpText')
+    body_chars = u32(lw_offset + 12)
+    fc_count_offset = lw_offset + 4 * lw_count
+    fc_count = u16(fc_count_offset)
+    fc_offset = fc_count_offset + 2
+    if fc_count < 34 or fc_offset + fc_count * 8 > len(wd_data):
+        raise ValueError('Truncated FibRgFcLcb97')
+    fc_clx, lcb_clx = struct.unpack_from('<II', wd_data, fc_offset + 33 * 8)
+    if body_chars > 0x7FFFFFFF:
+        raise ValueError('Invalid main-story character count')
+    return ('1Table' if flags & 0x0200 else '0Table',
+            fc_clx, lcb_clx, body_chars)
+
+
+def _extract_doc_piece_table(wd_data: bytes, table_data: bytes) -> str:
+    """只读 CLX 引用的正文；不扫描元数据、旧修订残留或其他 OLE 流。"""
+    _, fc_clx, lcb_clx, body_chars = _doc_fib_info(wd_data)
+    if lcb_clx < 5 or fc_clx + lcb_clx > len(table_data):
+        raise ValueError('Invalid CLX range')
+    clx = memoryview(table_data)[fc_clx:fc_clx + lcb_clx]
+    pos = 0
+    # 可有零个或多个 Prc（0x01 + 2字节长度 + grpprl）。
+    while pos < len(clx) and clx[pos] == 1:
+        cb = struct.unpack_from('<h', clx, pos + 1)[0]
+        if cb < 0 or pos + 3 + cb > len(clx):
+            raise ValueError('Invalid CLX Prc')
+        pos += 3 + cb
+    if pos + 5 > len(clx) or clx[pos] != 2:
+        raise ValueError('Missing CLX Pcdt')
+    plc_size = struct.unpack_from('<I', clx, pos + 1)[0]
+    if plc_size < 4 or (plc_size - 4) % 12 or pos + 5 + plc_size != len(clx):
+        raise ValueError('Invalid PlcPcd size')
+    piece_count = (plc_size - 4) // 12
+    plc = clx[pos + 5:]
+    pcd_offset = 4 * (piece_count + 1)
+    if struct.unpack_from('<I', plc, 0)[0] != 0:
+        raise ValueError('Piece character positions must start at zero')
+    chunks = []
+    remaining = min(body_chars, MAX_CONTENT_CHARS)
+    cp_start = 0
+    for i in range(piece_count):
+        cp_end = struct.unpack_from('<I', plc, 4 * (i + 1))[0]
+        if cp_end <= cp_start or cp_end > 0x7FFFFFFF:
+            raise ValueError('Invalid piece character positions')
+        raw_fc = struct.unpack_from('<I', plc, pcd_offset + 8 * i + 2)[0]
+        compressed = bool(raw_fc & 0x40000000)
+        fc = raw_fc & 0x3FFFFFFF
+        if compressed:
+            if fc % 2:
+                raise ValueError('Invalid compressed piece offset')
+            fc //= 2
+        width = 1 if compressed else 2
+        if fc + (cp_end - cp_start) * width > len(wd_data):
+            raise ValueError('Piece text is outside WordDocument')
+        take = min(cp_end - cp_start, remaining)
+        if take:
+            data = wd_data[fc:fc + take * width]
+            if compressed:
+                data = data.decode('latin-1').translate(_DOC_COMPRESSED_MAP).encode('utf-16le')
+            chunks.append(data)
+            remaining -= take
+        cp_start = cp_end
+    if cp_start < body_chars:
+        raise ValueError('Piece table does not cover main story')
+    # 合并后再解码，保留跨 piece 的 UTF-16 surrogate pair。
+    text = b''.join(chunks).decode('utf-16le', errors='replace')
+    text = text.replace('\r', '\n').replace('\x07', '\t')
+    text = text.replace('\x0b', '\n').replace('\x0c', '\n')
+    text = re.sub(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]', '', text)
+    # 正文重复段落、单字和数字表格单元格均应保留。
+    return '\n'.join(line.strip() for line in text.splitlines() if line.strip())[:MAX_CONTENT_CHARS]
+
+
+def extract_doc(filepath: str) -> str:
+    """提取未加密 Word 97+ OLE DOC 正文和表格文字，不还原排版。
+
+    不依赖 Word，也不回退全流扫描；不支持的版本/损坏文件返回空文本。
+    页眉、脚注、文本框等非正文 story 和嵌入对象不在此解析范围。
     """
     if not _check_file(filepath):
         return ''
-
-    # 方式1：win32com 调用 Word（Windows 上最可靠）
-    if _check_win32com():
-        try:
-            import win32com.client
-            import threading
-
-            result_holder = [None]
-
-            def _do_extract():
-                word = None
-                try:
-                    word = win32com.client.Dispatch('Word.Application')
-                    word.Visible = False
-                    word.DisplayAlerts = False
-                    doc = word.Documents.Open(
-                        os.path.abspath(filepath),
-                        ReadOnly=True,
-                        AddToRecentFiles=False
-                    )
-                    text = doc.Content.Text
-                    doc.Close(False)
-                    result_holder[0] = text
-                except Exception:
-                    pass
-                finally:
-                    if word:
-                        try:
-                            word.Quit()
-                        except Exception:
-                            pass
-
-            t = threading.Thread(target=_do_extract, daemon=True)
-            t.start()
-            t.join(timeout=10)
-
-            if result_holder[0] and len(result_holder[0].strip()) > 10:
-                return result_holder[0][:MAX_CONTENT_CHARS]
-        except Exception:
-            pass
-
-    # 方式2：纯 Python OLE 解析（不依赖任何外部软件，在任何电脑上都能工作）
     try:
-        import olefile
-        import struct
-
         if not olefile.isOleFile(filepath):
             return ''
-
-        ole = olefile.OleFileIO(filepath)
-        try:
+        with olefile.OleFileIO(filepath) as ole:
             if not ole.exists('WordDocument'):
                 return ''
             wd_data = ole.openstream('WordDocument').read()
-        finally:
-            ole.close()
-
-        # 扫描 WordDocument 流中的 UTF-16LE 文本
-        # Word 97 的文本以 UTF-16LE 存储，段落以 0x000D 或 0x0007 分隔
-        paragraphs = []
-        current = []
-        i = 0
-
-        while i < len(wd_data) - 1:
-            try:
-                c = struct.unpack_from('<H', wd_data, i)[0]
-            except struct.error:
-                break
-
-            if c == 0x000D or c == 0x0007:
-                # 段落分隔符
-                if current:
-                    text = ''.join(current).strip()
-                    if text:
-                        paragraphs.append(text)
-                    current = []
-            elif (0x4E00 <= c <= 0x9FFF or   # CJK 统一汉字（常用区）
-                  0x0020 <= c <= 0x007E or   # ASCII 可打印字符
-                  0x3000 <= c <= 0x303F or   # CJK 标点
-                  0xFF00 <= c <= 0xFFEF or   # 全角字符
-                  0x2014 <= c <= 0x2015 or   # 破折号
-                  0x201C <= c <= 0x201D or   # 引号
-                  0x2018 <= c <= 0x2019):    # 单引号
-                current.append(chr(c))
-            else:
-                # 遇到不可识别字符，结束当前块
-                if len(current) >= 2:
-                    text = ''.join(current).strip()
-                    if text:
-                        paragraphs.append(text)
-                current = []
-            i += 2
-
-        if current:
-            text = ''.join(current).strip()
-            if text:
-                paragraphs.append(text)
-
-        # 过滤乱码段落
-        def _is_meaningful(text: str) -> bool:
-            total = len(text)
-            if total < 5:
-                return False
-            # 统计常用汉字（4E00-9FFF，不含扩展区）
-            chinese_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-            # 统计 ASCII 字母
-            alpha_count = sum(1 for c in text if c.isalpha() and ord(c) < 128)
-            # 必须包含至少 2 个常用汉字 或 3 个连续字母
-            has_chinese = chinese_count >= 2
-            has_english = bool(re.search(r'[a-zA-Z]{3,}', text))
-            if not (has_chinese or has_english):
-                return False
-            # 常用汉字 + ASCII 字母占比必须 >= 50%
-            if (chinese_count + alpha_count) / total < 0.5:
-                return False
-            return True
-
-        # 去重并过滤
-        seen = set()
-        result_lines = []
-        for p in paragraphs:
-            p = p.strip()
-            if p and p not in seen and _is_meaningful(p):
-                seen.add(p)
-                result_lines.append(p)
-
-        result = '\n'.join(result_lines)
-        if len(result.strip()) > 5:
-            return result[:MAX_CONTENT_CHARS]
-    except Exception:
-        pass
-
-    return ''
+            table_name, _, _, _ = _doc_fib_info(wd_data)
+            if not ole.exists(table_name):
+                return ''
+            table_data = ole.openstream(table_name).read()
+            return _extract_doc_piece_table(wd_data, table_data)
+    except Exception as e:
+        logger.debug(f'提取 DOC piece table 失败 {filepath}: {e}')
+        return ''
 
 
 # ─────────────────────────────────────────────
@@ -441,9 +425,6 @@ def extract_ppt(filepath: str) -> str:
 
     # 方式2：olefile 扫描（兜底）
     try:
-        import olefile
-        import struct
-
         if not olefile.isOleFile(filepath):
             return ''
 

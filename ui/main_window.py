@@ -10,6 +10,7 @@ import time
 import threading
 import subprocess
 import multiprocessing
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -38,7 +39,7 @@ from core.indexer import IndexEngine, IndexBuilder
 from core.extractor import SUPPORTED_EXTENSIONS
 
 APP_NAME = "文档搜索索引"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 # ─── 样式表 ──────────────────────────────────────────────────────────────────
 
@@ -348,7 +349,10 @@ class IndexWorker(QThread):
         self._start_time = time.time()
         self._last_time = self._start_time
         self._last_count = 0
+        worker_engine = None
         try:
+            worker_engine = IndexEngine(self.engine.db_path)
+            self.builder.engine = worker_engine
             def _speed_cb(spd, eta):
                 cur = self._last_count
                 tot = 0  # total not needed here, already tracked in progress
@@ -364,9 +368,15 @@ class IndexWorker(QThread):
                 log_callback=lambda msg: self.log_msg.emit(msg),
                 speed_callback=_speed_cb,
             )
+            worker_engine.close()
+            worker_engine = None
             self.finished.emit(stats)
         except Exception as e:
+            logging.exception('索引失败，已保存的旧索引仍可加载搜索')
             self.error.emit(str(e))
+        finally:
+            if worker_engine is not None:
+                worker_engine.close()
 
     def stop(self):
         self.builder.stop()
@@ -751,8 +761,9 @@ class MainWindow(QMainWindow):
     def _build_search_panel(self) -> QWidget:
         """构建顶部搜索面板"""
         panel = QWidget()
-        panel.setStyleSheet("background-color: #FFFFFF; padding: 12px;")
-        panel.setMaximumHeight(100)
+        panel.setObjectName("search_panel")
+        panel.setStyleSheet("QWidget#search_panel { background-color: #FFFFFF; }")
+        panel.setFixedHeight(126)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -958,8 +969,9 @@ class MainWindow(QMainWindow):
     def _build_progress_panel(self) -> QWidget:
         """构建底部进度面板（v1.3：详细信息版）"""
         panel = QWidget()
+        panel.setObjectName("progress_panel")
         panel.setStyleSheet(
-            "QWidget { background: #E8F4FD; border-top: 2px solid #1976D2; }"
+            "QWidget#progress_panel { background: #E8F4FD; border-top: 2px solid #1976D2; }"
         )
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 10, 16, 10)
@@ -974,7 +986,11 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.progress_title)
         header_row.addStretch()
 
-        self.stop_btn = QPushButton("⏹ 停止索引")
+        self.stop_btn = QPushButton("停止索引")
+        self.stop_btn.setStyleSheet(
+            "QPushButton { background: #C62828; color: white; border: 2px solid #8E0000; padding: 6px 14px; }"
+            "QPushButton:disabled { background: #EF9A9A; color: #4E0000; }"
+        )
         self.stop_btn.setObjectName("btn_danger")
         self.stop_btn.setMinimumWidth(100)
         self.stop_btn.setMinimumHeight(32)
@@ -1098,6 +1114,9 @@ class MainWindow(QMainWindow):
 
     def _cleanup_orphans(self):
         """手动清理孤立记录（删除已不存在的文件的索引记录）"""
+        if self.index_worker and self.index_worker.isRunning():
+            QMessageBox.information(self, "索引正在运行", "请先停止当前索引，不能同时启动或切换索引。")
+            return
         if not self.engine:
             QMessageBox.information(self, "提示", "请先加载一个索引")
             return
@@ -1116,6 +1135,9 @@ class MainWindow(QMainWindow):
 
     def _new_index(self):
         """新建索引"""
+        if self.index_worker and self.index_worker.isRunning():
+            QMessageBox.information(self, "索引正在运行", "请先停止当前索引，不能同时启动或切换索引。")
+            return
         last_settings = {
             'root_dir': self.qsettings.value('last_root_dir', ''),
             'db_path': self.qsettings.value('last_db_path', ''),
@@ -1137,6 +1159,9 @@ class MainWindow(QMainWindow):
 
     def _load_index(self):
         """加载已有索引文件"""
+        if self.index_worker and self.index_worker.isRunning():
+            QMessageBox.information(self, "索引正在运行", "请先停止当前索引，不能同时启动或切换索引。")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "加载索引文件",
             self.qsettings.value('last_db_path', os.path.expanduser('~')),
@@ -1146,6 +1171,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            if self.engine:
+                self.engine.close()
             self.engine = IndexEngine(path)
             info = self.engine.get_index_info()
             total = info.get('total_docs', 0)
@@ -1174,6 +1201,9 @@ class MainWindow(QMainWindow):
 
     def _update_index(self):
         """更新当前索引"""
+        if self.index_worker and self.index_worker.isRunning():
+            QMessageBox.information(self, "索引正在运行", "请先停止当前索引，不能同时启动或切换索引。")
+            return
         if not self.engine:
             QMessageBox.information(self, "提示", "请先新建或加载一个索引")
             return
@@ -1215,6 +1245,9 @@ class MainWindow(QMainWindow):
 
     def _start_indexing(self, settings: Dict):
         """开始索引任务"""
+        if self.index_worker and self.index_worker.isRunning():
+            QMessageBox.information(self, "索引正在运行", "请先停止当前索引，不能同时启动或切换索引。")
+            return
         db_path = settings['db_path']
         if not db_path:
             QMessageBox.warning(self, "错误", "索引文件路径不能为空")
@@ -1231,8 +1264,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"无法创建目录：{db_dir}\n{e}")
                 return
 
-        # 初始化引擎
-        self.engine = IndexEngine(db_path)
+        # 搜索连接留在GUI线程，索引线程创建独立写连接。
+        try:
+            if self.engine:
+                self.engine.close()
+            self.engine = IndexEngine(db_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法打开索引", str(exc))
+            return
 
         # 启动工作线程
         self.index_worker = IndexWorker(
@@ -1260,8 +1299,9 @@ class MainWindow(QMainWindow):
         self.stat_elapsed_label.setText("已用：0 秒")
         self.progress_label.setText("正在扫描目录...")
         self.progress_title.setText(f"正在建立索引：{settings['root_dir']}")
+        self.stop_btn.setText("停止索引")
         self.stop_btn.setEnabled(True)
-        self.search_btn.setEnabled(False)
+        self.search_btn.setEnabled(True)
         # 启动计时器
         import time as _time
         self._index_start_time = _time.time()
@@ -1278,7 +1318,7 @@ class MainWindow(QMainWindow):
             # IndexBuilder.stop() 会设置 _stop_flag 并关闭线程池
             self.index_worker.stop()
             # 给 UI 一个反馈，让用户知道已经发出停止信号
-            self._update_status("停止信号已发出，正在等待当前文件处理完成...")
+            self._update_status("停止信号已发出，正在保存已完成结果...")
 
     def _on_index_progress(self, current: int, total: int, filepath: str):
         """索引进度更新"""
@@ -1367,12 +1407,13 @@ class MainWindow(QMainWindow):
             elapsed_str = f"{h} 小时 {m} 分"
 
         avg_speed = stats['total'] / total_elapsed if total_elapsed > 0 else 0
-        msg = (f"索引完成！共 {stats['total']} 个文件\n"
+        title = "索引已停止" if stats.get("stopped") else "索引完成"
+        msg = (f"{title}！共 {stats['total']} 个文件\n"
                f"新增 {stats['added']} 个，更新 {stats['updated']} 个，"
                f"跳过 {stats['skipped']} 个，失败 {stats['failed']} 个\n"
                f"总耗时：{elapsed_str}，平均速度：{avg_speed:.1f} 文件/秒")
         self._update_status(msg.replace('\n', ' '))
-        QMessageBox.information(self, "索引完成", msg)
+        QMessageBox.information(self, title, msg)
 
     def _on_index_error(self, error: str):
         """索引出错"""
@@ -1770,9 +1811,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭时保存状态"""
         self.qsettings.setValue('geometry', self.saveGeometry())
-        if self.engine:
-            self.engine.close()
         if self.index_worker and self.index_worker.isRunning():
             self.index_worker.stop()
-            self.index_worker.wait(3000)
+            if not self.index_worker.wait(1500):
+                self._update_status("正在保存已完成结果，请稍后再关闭窗口")
+                event.ignore()
+                return
+        if self.engine:
+            self.engine.close()
         event.accept()

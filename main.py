@@ -5,6 +5,8 @@
 
 import sys
 import os
+import logging
+import tempfile
 
 # 确保 Windows 下 DPI 缩放正常
 if sys.platform == 'win32':
@@ -35,6 +37,17 @@ from ui.main_window import MainWindow, STYLE_SHEET
 
 
 def main():
+    # 日志只留在本机，不上传文件名和单位资料。只记录警告/错误，避免
+    # 几万文件时大量日志降低速度。只读EXE目录时使用系统临时目录。
+    for directory in [_exe_dir, tempfile.gettempdir()]:
+        try:
+            log_path = os.path.join(directory, 'DocFinder_v2.3.log')
+            handler = logging.FileHandler(log_path, encoding='utf-8')
+            logging.basicConfig(level=logging.WARNING, handlers=[handler],
+                                format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+            break
+        except OSError:
+            continue
     # 高 DPI 支持
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
